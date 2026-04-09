@@ -1,0 +1,400 @@
+{
+  "id": "WethrBackfill001",
+  "name": "Wethr Backfill Weather Data",
+  "active": false,
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "bf-trigger-0001",
+      "name": "Run Manually"
+    },
+    {
+      "parameters": {
+        "fileSelector": "/data/wethr/all_settled_trades.json",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        224,
+        0
+      ],
+      "id": "bf-read-0001",
+      "name": "Read All Trades"
+    },
+    {
+      "parameters": {
+        "jsCode": "const binaryData = await this.helpers.getBinaryDataBuffer(0, 'data');\nconst raw = binaryData.toString('utf8');\nconst trades = JSON.parse(raw);\n\nif (trades.length === 0) {\n  return [{ json: { error: 'No trades found' } }];\n}\n\nconst cityConfig = {\n  nyc:          { lat: 40.77, lon: -73.87, station: 'KLGA', unit: 'fahrenheit', tz: 'America/New_York',       iem_station: 'LGA', iem_network: 'NY_ASOS' },\n  chicago:      { lat: 41.98, lon: -87.90, station: 'KORD', unit: 'fahrenheit', tz: 'America/Chicago',        iem_station: 'ORD', iem_network: 'IL_ASOS' },\n  miami:        { lat: 25.79, lon: -80.29, station: 'KMIA', unit: 'fahrenheit', tz: 'America/New_York',       iem_station: 'MIA', iem_network: 'FL_ASOS' },\n  atlanta:      { lat: 33.64, lon: -84.43, station: 'KATL', unit: 'fahrenheit', tz: 'America/New_York',       iem_station: 'ATL', iem_network: 'GA_ASOS' },\n  dallas:       { lat: 32.90, lon: -97.04, station: 'KDFW', unit: 'fahrenheit', tz: 'America/Chicago',        iem_station: 'DFW', iem_network: 'TX_ASOS' },\n  seattle:      { lat: 47.45, lon: -122.31,station: 'KSEA', unit: 'fahrenheit', tz: 'America/Los_Angeles',    iem_station: 'SEA', iem_network: 'WA_ASOS' },\n  denver:       { lat: 39.86, lon: -104.67,station: 'KDEN', unit: 'fahrenheit', tz: 'America/Denver',         iem_station: 'DEN', iem_network: 'CO_ASOS' },\n  los_angeles:  { lat: 33.94, lon: -118.41,station: 'KLAX', unit: 'fahrenheit', tz: 'America/Los_Angeles',    iem_station: 'LAX', iem_network: 'CA_ASOS' },\n  toronto:      { lat: 43.68, lon: -79.63, station: 'CYYZ', unit: 'celsius',    tz: 'America/Toronto',        iem_station: 'CYYZ', iem_network: 'CA_ON_ASOS' },\n  london:       { lat: 51.51, lon: 0.05,   station: 'EGLC', unit: 'celsius',    tz: 'Europe/London',          iem_station: 'EGLC', iem_network: 'GB__ASOS' },\n  seoul:        { lat: 37.46, lon: 126.44, station: 'RKSI', unit: 'celsius',    tz: 'Asia/Seoul',             iem_station: 'RKSI', iem_network: 'KR__ASOS' },\n  paris:        { lat: 48.73, lon: 2.37,   station: 'LFPO', unit: 'celsius',    tz: 'Europe/Paris',           iem_station: 'LFPO', iem_network: 'FR__ASOS' },\n  tel_aviv:     { lat: 32.01, lon: 34.77,  station: 'LLBG', unit: 'celsius',    tz: 'Asia/Jerusalem',         iem_station: 'LLBG', iem_network: 'IS__ASOS' },\n  sao_paulo:    { lat: -23.43,lon: -46.47, station: 'SBGR', unit: 'celsius',    tz: 'America/Sao_Paulo',      iem_station: 'SBGR', iem_network: 'BR__ASOS' },\n  buenos_aires: { lat: -34.82,lon: -58.54, station: 'SAEZ', unit: 'celsius',    tz: 'America/Argentina/Buenos_Aires', iem_station: 'SAEZ', iem_network: 'AR__ASOS' },\n};\n\n// Group by city+date (same logic as the daily audit)\nconst cityDates = {};\nfor (const t of trades) {\n  const key = `${t.city}|${t.target_date}`;\n  const cfg = cityConfig[t.city];\n  if (!cfg) continue;\n\n  if (!cityDates[key]) {\n    cityDates[key] = {\n      city: t.city,\n      target_date: t.target_date,\n      lat: cfg.lat, lon: cfg.lon,\n      station: cfg.station, unit: cfg.unit, tz: cfg.tz,\n      iem_station: cfg.iem_station, iem_network: cfg.iem_network,\n      trade_count: 0,\n      trades: []\n    };\n  }\n  cityDates[key].trade_count++;\n  cityDates[key].trades.push(t);\n}\n\nreturn Object.values(cityDates).map(cd => ({ json: cd }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        448,
+        0
+      ],
+      "id": "bf-parse-0001",
+      "name": "Group by City+Date"
+    },
+    {
+      "parameters": {
+        "url": "https://archive-api.open-meteo.com/v1/archive",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "latitude",
+              "value": "={{ $json.lat }}"
+            },
+            {
+              "name": "longitude",
+              "value": "={{ $json.lon }}"
+            },
+            {
+              "name": "daily",
+              "value": "temperature_2m_max"
+            },
+            {
+              "name": "timezone",
+              "value": "={{ $json.tz }}"
+            },
+            {
+              "name": "start_date",
+              "value": "={{ $json.target_date }}"
+            },
+            {
+              "name": "end_date",
+              "value": "={{ $json.target_date }}"
+            },
+            {
+              "name": "temperature_unit",
+              "value": "={{ $json.unit }}"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 1500
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        672,
+        -96
+      ],
+      "id": "bf-om-0001",
+      "name": "Fetch Open-Meteo",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "url": "https://mesonet.agron.iastate.edu/api/1/daily.json",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "station",
+              "value": "={{ $json.iem_station }}"
+            },
+            {
+              "name": "network",
+              "value": "={{ $json.iem_network }}"
+            },
+            {
+              "name": "date",
+              "value": "={{ $json.target_date }}"
+            }
+          ]
+        },
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 1,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        672,
+        96
+      ],
+      "id": "bf-iem-0001",
+      "name": "Fetch IEM",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "alwaysOutputData": true,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combineBy": "combineByPosition",
+        "options": {
+          "includeUnpaired": true
+        }
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3.2,
+      "position": [
+        896,
+        0
+      ],
+      "id": "bf-merge-0001",
+      "name": "Merge"
+    },
+    {
+      "parameters": {
+        "jsCode": "const trades = $('Group by City+Date').all();\nconst items = $input.all();\nconst results = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const tradeItem = trades[i].json;\n  const merged = items[i].json;\n  \n  const city = tradeItem.city;\n  const date = tradeItem.target_date;\n  const cityTrades = tradeItem.trades;\n  \n  let om_temp = null;\n  try {\n    const omDaily = merged.daily;\n    if (omDaily && omDaily.temperature_2m_max && omDaily.temperature_2m_max[0] != null) {\n      om_temp = omDaily.temperature_2m_max[0];\n    }\n  } catch (e) {}\n  \n  let iem_temp = null;\n  try {\n    const iemData = merged.data;\n    if (iemData && iemData.length > 0) {\n      const obs = iemData[0];\n      const bracketUnit = cityTrades[0]?.bracket_unit;\n      if (bracketUnit === 'F') {\n        iem_temp = obs.max_tmpf != null ? obs.max_tmpf : null;\n      } else {\n        if (obs.max_tmpc != null) {\n          iem_temp = obs.max_tmpc;\n        } else if (obs.max_tmpf != null) {\n          iem_temp = Math.round(((obs.max_tmpf - 32) * 5 / 9) * 10) / 10;\n        }\n      }\n    }\n  } catch (e) {}\n  \n  let wu_temp = null;\n  const winningTrade = cityTrades.find(t => t.outcome === 1 && t.side === 'YES');\n  if (winningTrade) {\n    wu_temp = (winningTrade.bracket_lower + winningTrade.bracket_upper) / 2;\n  }\n  \n  const om_divergence = (om_temp != null && wu_temp != null) ?\n    Math.round((om_temp - wu_temp) * 10) / 10 : null;\n  const iem_divergence = (iem_temp != null && wu_temp != null) ?\n    Math.round((iem_temp - wu_temp) * 10) / 10 : null;\n  const om_iem_divergence = (om_temp != null && iem_temp != null) ?\n    Math.round((om_temp - iem_temp) * 10) / 10 : null;\n  \n  const tradeDetails = cityTrades.map(t => {\n    const low = t.bracket_lower;\n    const high = t.bracket_upper;\n    const wu_hit = wu_temp != null && wu_temp >= low && (high == null || wu_temp < high);\n    const om_hit = om_temp != null && om_temp >= low && (high == null || om_temp < high);\n    const iem_hit = iem_temp != null && iem_temp >= low && (high == null || iem_temp < high);\n    \n    return {\n      trade_id: t.id,\n      bracket_label: t.bracket_label,\n      bracket_lower: low,\n      bracket_upper: high,\n      bracket_unit: t.bracket_unit,\n      side: t.side,\n      entry_price: t.entry_price,\n      size_usd: t.size_usd,\n      pnl: t.pnl,\n      model_prob: t.model_prob,\n      market_prob: t.market_prob,\n      edge: t.edge,\n      confidence: t.confidence,\n      outcome: t.outcome,\n      wu_hit,\n      om_hit: om_temp != null ? om_hit : null,\n      iem_hit: iem_temp != null ? iem_hit : null,\n      om_flipped: (om_temp != null && wu_temp != null) ? (om_hit !== wu_hit) : null,\n      iem_flipped: (iem_temp != null && wu_temp != null) ? (iem_hit !== wu_hit) : null,\n    };\n  });\n  \n  const bracketUnit = cityTrades[0]?.bracket_unit || '';\n  \n  results.push({\n    json: {\n      city, date, station: tradeItem.station,\n      bracket_unit: bracketUnit,\n      wu_temp, om_temp, iem_temp,\n      om_divergence, iem_divergence, om_iem_divergence,\n      n_trades: cityTrades.length,\n      om_n_flipped: tradeDetails.filter(f => f.om_flipped === true).length,\n      iem_n_flipped: tradeDetails.filter(f => f.iem_flipped === true).length,\n      trade_details: tradeDetails,\n      has_om: om_temp != null,\n      has_iem: iem_temp != null,\n      has_wu: wu_temp != null,\n    }\n  });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        0
+      ],
+      "id": "bf-diverge-0001",
+      "name": "Compute Divergence"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst header = 'city,market_date,trade_id,bracket,side,entry_price,size_usd,pnl,model_prob,market_prob,edge,confidence,outcome,wu_temp,om_temp,iem_temp,om_divergence,iem_divergence,bracket_hit_wu,bracket_hit_om,bracket_hit_iem,om_flipped,iem_flipped';\nconst rows = [];\n\nfor (const item of items) {\n  const d = item.json;\n  for (const t of d.trade_details) {\n    rows.push([\n      d.city, d.date, t.trade_id, t.bracket_label, t.side,\n      t.entry_price ?? '', t.size_usd ?? '', t.pnl ?? '',\n      t.model_prob ?? '', t.market_prob ?? '', t.edge ?? '', t.confidence ?? '',\n      t.outcome ?? '',\n      d.wu_temp ?? '', d.om_temp ?? '', d.iem_temp ?? '',\n      d.om_divergence ?? '', d.iem_divergence ?? '',\n      t.wu_hit ?? '', t.om_hit ?? '', t.iem_hit ?? '',\n      t.om_flipped ?? '', t.iem_flipped ?? ''\n    ].join(','));\n  }\n}\n\nconst csv = header + '\\n' + rows.join('\\n') + '\\n';\nreturn [{\n  json: { totalTrades: rows.length, filename: 'backfill_trades.csv' },\n  binary: {\n    data: await this.helpers.prepareBinaryData(\n      Buffer.from(csv, 'utf-8'),\n      'backfill_trades.csv',\n      'text/csv'\n    )\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        -96
+      ],
+      "id": "bf-trade-csv-0001",
+      "name": "Build Trade CSV"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst header = 'city,market_date,station,wu_temp,om_temp,iem_temp,om_divergence,iem_divergence,om_iem_divergence,unit,n_trades,om_n_flipped,iem_n_flipped,has_om,has_iem,has_wu';\nconst rows = items.map(item => {\n  const d = item.json;\n  return [\n    d.city, d.date, d.station,\n    d.wu_temp ?? '', d.om_temp ?? '', d.iem_temp ?? '',\n    d.om_divergence ?? '', d.iem_divergence ?? '', d.om_iem_divergence ?? '',\n    d.bracket_unit ?? '', d.n_trades,\n    d.om_n_flipped ?? '', d.iem_n_flipped ?? '',\n    d.has_om, d.has_iem, d.has_wu\n  ].join(',');\n});\n\nconst csv = header + '\\n' + rows.join('\\n') + '\\n';\nreturn [{\n  json: { totalDays: rows.length, filename: 'backfill_daily.csv' },\n  binary: {\n    data: await this.helpers.prepareBinaryData(\n      Buffer.from(csv, 'utf-8'),\n      'backfill_daily.csv',\n      'text/csv'\n    )\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1344,
+        96
+      ],
+      "id": "bf-daily-csv-0001",
+      "name": "Build Daily CSV"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "/data/wethr/backfill_trades.csv",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        1568,
+        -96
+      ],
+      "id": "bf-save-trade-0001",
+      "name": "Save Trade CSV"
+    },
+    {
+      "parameters": {
+        "operation": "write",
+        "fileName": "/data/wethr/backfill_daily.csv",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1.1,
+      "position": [
+        1568,
+        96
+      ],
+      "id": "bf-save-daily-0001",
+      "name": "Save Daily CSV"
+    },
+    {
+      "parameters": {
+        "jsCode": "const items = $input.all();\nconst tradeData = $('Build Trade CSV').first().json;\nconst dailyData = $('Build Daily CSV').first().json;\n\nconst msg = `\u2705 *Backfill Complete*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n*Trades:* ${tradeData.totalTrades} rows \u2192 backfill_trades.csv\n*Daily:*  ${dailyData.totalDays} city-dates \u2192 backfill_daily.csv\n\nFiles saved to /data/wethr/`;\n\nreturn [{ json: { message: msg } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1568,
+        300
+      ],
+      "id": "bf-summary-0001",
+      "name": "Build Summary"
+    },
+    {
+      "parameters": {
+        "chatId": "8670810799",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1792,
+        300
+      ],
+      "id": "bf-tg-0001",
+      "name": "Notify Complete",
+      "credentials": {
+        "telegramApi": {
+          "id": "tg_wethr_bot_001",
+          "name": "Telegram Wethr Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Run Manually": {
+      "main": [
+        [
+          {
+            "node": "Read All Trades",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read All Trades": {
+      "main": [
+        [
+          {
+            "node": "Group by City+Date",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Group by City+Date": {
+      "main": [
+        [
+          {
+            "node": "Fetch Open-Meteo",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Fetch IEM",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Open-Meteo": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch IEM": {
+      "main": [
+        [
+          {
+            "node": "Merge",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Merge": {
+      "main": [
+        [
+          {
+            "node": "Compute Divergence",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Divergence": {
+      "main": [
+        [
+          {
+            "node": "Build Trade CSV",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Daily CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Trade CSV": {
+      "main": [
+        [
+          {
+            "node": "Save Trade CSV",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Build Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Daily CSV": {
+      "main": [
+        [
+          {
+            "node": "Save Daily CSV",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Summary": {
+      "main": [
+        [
+          {
+            "node": "Notify Complete",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate"
+  }
+}

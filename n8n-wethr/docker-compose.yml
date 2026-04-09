@@ -1,0 +1,119 @@
+# =============================================================================
+# n8n Docker Compose — Wethr Divergence Tracker
+# =============================================================================
+# 
+# WHAT THIS FILE DOES:
+# Docker Compose is a way to define multi-container applications in a single
+# file. Right now we only have one container (n8n), but this approach means
+# you can easily add a database later (like Postgres for storing divergence
+# data) just by adding another section below.
+#
+# HOW TO USE:
+#   cd ~/projects/wethr/n8n-wethr
+#   docker compose up -d       ← starts n8n in the background
+#   docker compose logs -f     ← watch the logs (Ctrl+C to stop watching)
+#   docker compose down        ← stops n8n
+#   docker compose restart     ← restart if something's weird
+#
+# Once running, open http://localhost:5678 in your browser.
+# =============================================================================
+ 
+services:
+  n8n:
+    # The official n8n Docker image. "latest" grabs the newest stable release.
+    image: n8nio/n8n:latest
+ 
+    # Container name makes it easier to reference in commands like:
+    #   docker logs n8n
+    #   docker exec -it n8n sh
+    container_name: n8n
+ 
+    # PORT MAPPING — "host:container"
+    # n8n runs on port 5678 inside the container. This maps it to the same
+    # port on your machine so you can hit http://localhost:5678.
+    # If 5678 conflicts with something, change the LEFT number (e.g., 5679:5678).
+    ports:
+      - "5678:5678"
+ 
+    environment:
+      # ── BASICS ──
+      # These set n8n's internal URL awareness. Important for webhooks later.
+      - N8N_HOST=localhost
+      - N8N_PORT=5678
+      - N8N_PROTOCOL=http
+ 
+      # WEBHOOK_URL tells n8n what base URL to use when generating webhook URLs.
+      # For now it's localhost. When you set up Tailscale/Cloudflare Tunnel later,
+      # you'd change this to your public URL so external services can trigger workflows.
+      - WEBHOOK_URL=http://localhost:5678/
+ 
+      # ── TIMEZONE ──
+      # Critical for a weather project! Cron triggers and timestamps will use this.
+      # America/Edmonton covers Alberta (MST/MDT). n8n uses IANA timezone names.
+      - GENERIC_TIMEZONE=America/Edmonton
+      - TZ=America/Edmonton
+ 
+      # ── SECURITY ──
+      # n8n has a built-in auth system. On first launch it'll ask you to create
+      # an owner account. This just enables that feature.
+      - N8N_BASIC_AUTH_ACTIVE=true
+ 
+      # ── EXECUTION SETTINGS ──
+      # By default n8n uses SQLite for its internal database (workflow definitions,
+      # execution history, credentials). That's fine for our use case.
+      # The data lives in the volume mapped below.
+      
+      # Keep execution history for 30 days so you can debug failed runs.
+      # Without this, n8n prunes aggressively and you lose debugging context.
+      - EXECUTIONS_DATA_MAX_AGE=720
+ 
+      # Save successful executions too (not just failures). Useful while learning
+      # so you can inspect what each node produced even when everything worked.
+      - EXECUTIONS_DATA_SAVE_ON_SUCCESS=all
+      #Read/Write Files is allowed to access data/wethr
+
+      - N8N_RESTRICT_FILE_ACCESS_TO=/data/wethr;/data/wethr-db
+
+      # ── CODE NODE EXTERNAL MODULES ──
+      # Allows `require('sqlite3')` inside Code nodes. The `sqlite3` npm package
+      # is already bundled inside the n8n image (n8n uses it for its own internal
+      # database), so we don't need to install anything — we just need to tell
+      # n8n's Code node sandbox that it's safe to import.
+      #
+      # We use this so the Wethr audit workflow can read/write a local SQLite
+      # database at /data/wethr/wethr_audit.db directly from Code nodes. The
+      # trading engine also uses SQLite (at /data/wethr-db/wethr.db, mounted
+      # read-only into this container), so the whole project stays on one DB
+      # engine — a future analysis script can ATTACH both and JOIN across them.
+      #
+      # Note: we deliberately do NOT set NODE_FUNCTION_ALLOW_BUILTIN. That would
+      # re-enable `require('fs')` etc. in Code nodes, which n8n blocks by default
+      # for security. File access from workflows should go through the
+      # Read/Write Files node, not raw fs.
+      - NODE_FUNCTION_ALLOW_EXTERNAL=sqlite3
+    volumes:
+      # PERSISTENT STORAGE — this is the critical line.
+      #
+      # Docker containers are ephemeral — when you `docker compose down` and
+      # `up` again, everything inside the container is gone. Volumes solve this
+      # by mapping a folder on your real filesystem to a folder inside the container.
+      #
+      # "n8n_data" is a named Docker volume (Docker manages where it actually
+      # lives on disk, usually /var/lib/docker/volumes/). Everything n8n saves —
+      # your workflows, credentials, execution logs — goes into /home/node/.n8n
+      # inside the container, which is actually stored in this volume.
+      #
+      # This means you can destroy and recreate the container freely without
+      # losing your work. The volume persists independently.
+      - n8n_data:/home/node/.n8n
+      - ./wethr-output:/data/wethr
+      - ../data:/data/wethr-db:ro
+    # RESTART POLICY — if n8n crashes or your machine reboots, Docker will
+    # automatically restart it. "unless-stopped" means it restarts always
+    # EXCEPT if you explicitly ran `docker compose stop` or `docker compose down`.
+    restart: unless-stopped
+ 
+# Named volumes section — declares the volume used above.
+# Docker creates this automatically on first `docker compose up`.
+volumes:
+  n8n_data:

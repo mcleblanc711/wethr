@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+
+# Local data (databases, exports, scratch)
+data/
+collector/data/
+n8n-wethr/wethr-output/
+n8n_data/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Claude local
+.claude/

@@ -1,0 +1,81 @@
+{
+  "name": "Wethr Error Alert",
+  "active": true,
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "err-trigger-0001",
+      "name": "On Workflow Error"
+    },
+    {
+      "parameters": {
+        "jsCode": "const execution = $json;\n\nconst wfName = execution.workflow?.name || 'Unknown workflow';\nconst wfId = execution.workflow?.id || '?';\nconst errorMsg = execution.execution?.error?.message || 'No error message';\nconst ts = new Date().toISOString().replace('T', ' ').split('.')[0];\n\nlet msg = `\ud83d\udea8 *Workflow Error*\\n`;\nmsg += `\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\\n`;\nmsg += `*Workflow:* ${wfName}\\n`;\nmsg += `*Time:* ${ts} UTC\\n`;\nmsg += `*Error:* ${errorMsg}\\n\\n`;\nmsg += `[View in n8n](http://localhost:5678/workflow/${wfId}/executions)`;\n\nreturn [{ json: { message: msg } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        224,
+        0
+      ],
+      "id": "err-format-0001",
+      "name": "Format Error"
+    },
+    {
+      "parameters": {
+        "chatId": "8670810799",
+        "text": "={{ $json.message }}",
+        "additionalFields": {
+          "parse_mode": "Markdown"
+        }
+      },
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        448,
+        0
+      ],
+      "id": "err-telegram-0001",
+      "name": "Send Error Alert",
+      "credentials": {
+        "telegramApi": {
+          "id": "tg_wethr_bot_001",
+          "name": "Telegram Wethr Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "On Workflow Error": {
+      "main": [
+        [
+          {
+            "node": "Format Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Error": {
+      "main": [
+        [
+          {
+            "node": "Send Error Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "id": "WethrErrorAlert01"
+}
