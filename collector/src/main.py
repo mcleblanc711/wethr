@@ -404,6 +404,24 @@ def main():
     # emos
     sub.add_parser("emos", help="Show EMOS parameters for all cities")
 
+    # export-settled
+    p_export = sub.add_parser("export-settled", help="Export settled trades for n8n")
+    p_export.add_argument(
+        "--out",
+        type=str,
+        default=None,
+        help="Output JSON path, defaults to n8n-wethr/wethr-output/settled_trades.json",
+    )
+    p_export.add_argument(
+        "--since-hours",
+        type=int,
+        default=24,
+        help="Lookback window for settled_at timestamps",
+    )
+
+    # doctor
+    sub.add_parser("doctor", help="Show local database/export wiring status")
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -538,6 +556,19 @@ def main():
                     f"{p.c:>8.3f} {p.d:>8.3f} "
                     f"{p.crps_train:>8.4f} {p.crps_test:>8.4f} {p.n_training:>6d}"
                 )
+
+    elif args.command == "export-settled":
+        from pathlib import Path
+        from .ops import export_settled_trades
+
+        out_path = Path(args.out).expanduser() if args.out else None
+        path, count = export_settled_trades(out_path=out_path, since_hours=args.since_hours)
+        print(f"Exported {count} settled trade(s) to {path}")
+
+    elif args.command == "doctor":
+        from .ops import doctor_report
+
+        print(doctor_report())
 
 
 if __name__ == "__main__":

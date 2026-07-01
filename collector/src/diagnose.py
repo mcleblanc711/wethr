@@ -30,7 +30,7 @@ from .markets import (
     parse_bracket_label,
 )
 from .ensemble import (
-    _build_ensemble_url,
+    _build_single_url,
     _parse_ensemble_response,
     c_to_f,
 )
@@ -112,8 +112,9 @@ async def diagnose_gamma(client: httpx.AsyncClient) -> bool:
 
         # Sanity checks
         if abs(prob_sum - 1.0) > 0.15:
-            print(f"     ⚠️  Prices sum to {prob_sum:.2f} (expected ~1.0)")
-            ok = False
+            # Live bracket prices are not guaranteed to be normalized; spreads,
+            # stale quotes, and crossed books can move the sum away from 1.0.
+            print(f"     ⚠️  Prices sum to {prob_sum:.2f} (market quotes not normalized)")
         else:
             print(f"     ✅ Prices sum to {prob_sum:.2f}")
 
@@ -147,7 +148,7 @@ async def diagnose_ensemble(
         expected_members = config.MODEL_MEMBER_COUNTS.get(model, "?")
         print(f"\n  [{model}] (expected: {expected_members} members)")
 
-        url = _build_ensemble_url(city, model)
+        url = _build_single_url(city, model)
         print(f"  URL: {url}")
 
         try:
@@ -178,40 +179,40 @@ async def diagnose_ensemble(
             ok = False
             continue
 
-        daily = data.get("daily", {})
-        times = daily.get("time", [])
-        member_keys = [k for k in daily.keys() if "member" in k]
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+        member_keys = [k for k in hourly.keys() if "member" in k]
 
         print(f"  Response: lat={data.get('latitude')}, lon={data.get('longitude')}")
-        print(f"  Dates: {len(times)} ({times[0] if times else 'N/A'} → {times[-1] if times else 'N/A'})")
+        print(f"  Hours: {len(times)} ({times[0] if times else 'N/A'} -> {times[-1] if times else 'N/A'})")
         print(f"  Member keys: {len(member_keys)}")
 
         if member_keys:
-            # Show first member's first few values
+            # Show first member's first few hourly values
             first_key = sorted(member_keys)[0]
-            vals = daily[first_key][:3]
+            vals = hourly[first_key][:3]
             print(f"  Sample ({first_key}): {vals}")
 
-            # Parse and verify
-            parsed = _parse_ensemble_response(data, city_slug, model)
+            # Parse and verify local-day daily maxima
+            parsed = _parse_ensemble_response(data, city_slug, model, tz_name=city.timezone)
             if parsed:
                 first_date = sorted(parsed.keys())[0]
                 members = parsed[first_date]
                 print(
-                    f"  ✅ Parsed: {len(members)} members for {first_date}, "
-                    f"range: {min(m.daily_max for m in members):.1f}°C – "
-                    f"{max(m.daily_max for m in members):.1f}°C"
+                    f"  Parsed: {len(members)} members for {first_date}, "
+                    f"range: {min(m.daily_max for m in members):.1f} deg C - "
+                    f"{max(m.daily_max for m in members):.1f} deg C"
                 )
                 if isinstance(expected_members, int) and len(members) != expected_members:
                     print(
-                        f"  ⚠️  Expected {expected_members} members, got {len(members)}"
+                        f"  Warning: expected {expected_members} members, got {len(members)}"
                     )
             else:
-                print(f"  ❌ Parse returned no data")
+                print(f"  FAIL: parse returned no data")
                 ok = False
         else:
-            print(f"  ❌ No member keys in response — wrong variable name?")
-            print(f"  Available keys: {sorted(daily.keys())}")
+            print(f"  FAIL: no member keys in response; wrong variable name?")
+            print(f"  Available keys: {sorted(hourly.keys())}")
             ok = False
 
     return ok

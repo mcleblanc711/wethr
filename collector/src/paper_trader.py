@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+from os import PathLike
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
@@ -130,26 +131,51 @@ def get_db(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, N
         conn.close()
 
 
+def _add_column_if_missing(
+    conn: sqlite3.Connection,
+    table: str,
+    column: str,
+    ddl: str,
+) -> None:
+    """Add a SQLite column, tolerating concurrent init_db calls."""
+    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+    if column in cols:
+        return
+    try:
+        conn.execute(ddl)
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" in str(exc).lower():
+            return
+        raise
+
+
 def init_db(db_path: Path | None = None) -> None:
     """Initialize database schema."""
     with get_db(db_path) as conn:
         conn.executescript(_SCHEMA)
-        # Migrate existing DBs: add columns if missing
-        for table in ("trades", "signals"):
-            cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-            if "market_volume" not in cols:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN market_volume REAL")
-        # Trades-only migrations for auto-redeem tracking
-        trade_cols = [r[1] for r in conn.execute("PRAGMA table_info(trades)").fetchall()]
-        if "redeemed" not in trade_cols:
-            conn.execute("ALTER TABLE trades ADD COLUMN redeemed INTEGER NOT NULL DEFAULT 0")
-        if "redeemed_at" not in trade_cols:
-            conn.execute("ALTER TABLE trades ADD COLUMN redeemed_at TEXT")
-        # Signals-only migrations for EMOS support
-        sig_cols = [r[1] for r in conn.execute("PRAGMA table_info(signals)").fetchall()]
+        # Migrate existing DBs: add columns if missing. These guards also
+        # tolerate two Wethr processes starting at the same time.
+        _add_column_if_missing(
+            conn, "trades", "market_volume",
+            "ALTER TABLE trades ADD COLUMN market_volume REAL",
+        )
+        _add_column_if_missing(
+            conn, "signals", "market_volume",
+            "ALTER TABLE signals ADD COLUMN market_volume REAL",
+        )
+        _add_column_if_missing(
+            conn, "trades", "redeemed",
+            "ALTER TABLE trades ADD COLUMN redeemed INTEGER NOT NULL DEFAULT 0",
+        )
+        _add_column_if_missing(
+            conn, "trades", "redeemed_at",
+            "ALTER TABLE trades ADD COLUMN redeemed_at TEXT",
+        )
         for col in ("ensemble_mean", "ensemble_std", "resolved_value"):
-            if col not in sig_cols:
-                conn.execute(f"ALTER TABLE signals ADD COLUMN {col} REAL")
+            _add_column_if_missing(
+                conn, "signals", col,
+                f"ALTER TABLE signals ADD COLUMN {col} REAL",
+            )
         # Create settings table if missing (migration for existing DBs)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS settings (
@@ -159,6 +185,16 @@ def init_db(db_path: Path | None = None) -> None:
             )
         """)
     log.info(f"Database initialized: {db_path or config.DB_PATH}")
+
+
+def _coerce_legacy_db_path_arg(
+    market_volume: float | PathLike[str] | str,
+    db_path: Path | None,
+) -> tuple[float, Path | None]:
+    """Support older positional calls that passed db_path as market_volume."""
+    if db_path is None and isinstance(market_volume, (str, PathLike)):
+        return 0.0, Path(market_volume)
+    return float(market_volume or 0.0), db_path
 
 
 # ---------------------------------------------------------------------------
@@ -176,6 +212,7 @@ def record_paper_trade(
     Record a paper trade with city/date context. Returns trade ID,
     or None if a trade already exists for this bracket.
     """
+    market_volume, db_path = _coerce_legacy_db_path_arg(market_volume, db_path)
     bp = ps.bracket_prob
     b = bp.bracket
 
@@ -262,6 +299,7 @@ def record_signal(
     at settlement time — this is correct because we want to score our
     best estimate, not our first one.
     """
+    market_volume, db_path = _coerce_legacy_db_path_arg(market_volume, db_path)
     with get_db(db_path) as conn:
         conn.execute(
             """

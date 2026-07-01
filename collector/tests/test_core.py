@@ -904,6 +904,38 @@ def test_trade_dedup():
         assert tid2 is None, "Duplicate trade should return None"
 
 
+def test_export_settled_trades():
+    """Settled export should write n8n-compatible JSON without sqlite3/jq."""
+    from src.markets import Bracket
+    from src.ops import export_settled_trades
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp_path = Path(tmp)
+        db_path = tmp_path / "export.db"
+        out_path = tmp_path / "settled_trades.json"
+        init_db(db_path)
+
+        bracket = Bracket(
+            token_id="t1", label="72°F - 74°F",
+            lower=72, upper=74, unit="F", market_prob=0.20, condition_id="c1",
+        )
+        bp = BracketProbability(
+            bracket=bracket, model_prob=0.35, market_prob=0.20,
+            edge=0.15, member_count=50, total_members=143, confidence=0.70,
+        )
+        ps = size_position(bp, bankroll=10000.0)
+        tid = record_paper_trade("nyc", date(2026, 3, 22), ps, db_path)
+        settle_trade(tid, outcome=True, db_path=db_path)
+
+        path, count = export_settled_trades(out_path=out_path, db_path=db_path)
+
+        assert path == out_path
+        assert count == 1
+        data = __import__("json").loads(out_path.read_text(encoding="utf-8"))
+        assert data[0]["trade_id"] == tid
+        assert data[0]["city"] == "nyc"
+
+
 # ===================================================================
 # Run all tests
 # ===================================================================

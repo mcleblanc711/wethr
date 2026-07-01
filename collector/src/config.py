@@ -13,10 +13,14 @@ from pathlib import Path
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_DIR = PROJECT_ROOT / "data"
-DATA_DIR.mkdir(exist_ok=True)
-DB_PATH = DATA_DIR / "wethr.db"
+COLLECTOR_ROOT = Path(__file__).resolve().parent.parent
+REPO_ROOT = COLLECTOR_ROOT.parent
+
+DATA_DIR = Path(os.getenv("WETHR_DATA_DIR", str(REPO_ROOT / "data"))).expanduser()
+DB_PATH = Path(os.getenv("WETHR_DB_PATH", str(DATA_DIR / "wethr.db"))).expanduser()
+
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
 # ---------------------------------------------------------------------------
 # Gamma API (Polymarket market discovery)

@@ -24,9 +24,10 @@ from pathlib import Path
 # `source .venv/bin/activate` — it finds the adjacent .venv and re-execs.
 # ---------------------------------------------------------------------------
 _HERE = Path(__file__).resolve().parent
-_VENV_PYTHON = _HERE / ".venv" / "bin" / "python"
+_VENV_DIR = _HERE / ".venv"
+_VENV_PYTHON = _VENV_DIR / "bin" / "python"
 
-if _VENV_PYTHON.exists() and Path(sys.executable).resolve() != _VENV_PYTHON.resolve():
+if _VENV_PYTHON.exists() and Path(sys.prefix).resolve() != _VENV_DIR.resolve():
     os.execv(str(_VENV_PYTHON), [str(_VENV_PYTHON)] + sys.argv)
 
 # ---------------------------------------------------------------------------

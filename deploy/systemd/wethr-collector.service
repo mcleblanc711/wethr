@@ -1,0 +1,15 @@
+[Unit]
+Description=Wethr paper-trading collector loop
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/wethr/collector
+Environment=WETHR_LIVE=0
+ExecStart=/usr/bin/python3 %h/projects/wethr/collector/run.py loop
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

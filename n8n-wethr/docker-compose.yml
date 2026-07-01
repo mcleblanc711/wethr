@@ -20,8 +20,8 @@
  
 services:
   n8n:
-    # The official n8n Docker image. "latest" grabs the newest stable release.
-    image: n8nio/n8n:latest
+    # Pin n8n so workflow behavior does not change under us on container recreate.
+    image: n8nio/n8n:2.13.2
  
     # Container name makes it easier to reference in commands like:
     #   docker logs n8n
@@ -41,6 +41,11 @@ services:
       - N8N_HOST=localhost
       - N8N_PORT=5678
       - N8N_PROTOCOL=http
+
+      # Keep the local automation stack quiet and deterministic.
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
+      - N8N_TEMPLATES_ENABLED=false
  
       # WEBHOOK_URL tells n8n what base URL to use when generating webhook URLs.
       # For now it's localhost. When you set up Tailscale/Cloudflare Tunnel later,

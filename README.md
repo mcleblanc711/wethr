@@ -15,9 +15,9 @@ wethr/
 └── data/           # Shared local databases (gitignored)
 ```
 
-The two halves talk via the shared SQLite database in `data/`: `collector/` writes
-trades and observations, and `n8n-wethr/` reads them (mounted read-only into the
-n8n container) to produce the divergence audit.
+The two halves talk via the shared SQLite database in `data/wethr.db`:
+`collector/` writes trades and observations, and `n8n-wethr/` reads it
+(mounted read-only into the n8n container) to produce the divergence audit.
 
 ## Sub-projects
 
@@ -34,12 +34,18 @@ cd collector
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 python run.py diagnose
+python run.py doctor
 
 # Divergence audit (separate terminal)
 cd n8n-wethr
 docker compose up -d
 # open http://localhost:5678
 ```
+
+`python run.py export-settled` writes `n8n-wethr/wethr-output/settled_trades.json`,
+the file consumed by the audit workflow. `python run.py doctor` reports the DB
+path, recent table activity, export status, and any legacy `collector/data`
+database still present.
 
 ## License
 

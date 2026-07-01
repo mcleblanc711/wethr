@@ -1,0 +1,7 @@
+[Unit]
+Description=Export Wethr settled trades for n8n audit
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/wethr/collector
+ExecStart=/usr/bin/python3 %h/projects/wethr/collector/run.py export-settled

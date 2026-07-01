@@ -13,7 +13,7 @@ Wethr fetches 109-member ensemble weather forecasts from four models (ECMWF, GEF
 ```
 Ensemble (109 members)  →  Probability per bracket  →  Edge = P(model) - P(market)
                          ↓                            ↓
-                    EMOS calibration              Kelly sizing (15% fractional)
+                    EMOS calibration              Kelly sizing (5% fractional)
                     BMA model weighting           Hard caps ($100/trade, 5% bankroll)
 ```
 
@@ -82,6 +82,8 @@ Note: `run.py` auto-detects the `.venv` directory and re-execs with the venv Pyt
 | `python run.py train --all` | Train EMOS for all cities |
 | `python run.py emos` | Show trained EMOS parameters |
 | `python run.py diagnose` | Validate all API endpoints |
+| `python run.py doctor` | Show local DB/export wiring status |
+| `python run.py export-settled` | Write settled-trade JSON for n8n |
 
 ## Probability estimation (4 phases)
 
@@ -102,15 +104,15 @@ Weights models by historical CRPS: w_i ∝ exp(-CRPS_i / T). ECMWF typically get
 
 ## Position sizing
 
-Fractional Kelly at 15% with three caps:
+Fractional Kelly at 5% with three caps:
 
 ```
 kelly = (model_prob - market_price) / (1 - market_price)
-size  = kelly × 0.15 × bankroll
+size  = kelly × 0.05 × bankroll
 size  = min(size, 0.05 × bankroll, $100)
 ```
 
-Why 15%? Full Kelly assumes perfect probability estimates. At 15%, a 2x overestimate of edge costs ~4% of bankroll vs ~25% at full Kelly.
+Why 5%? Full Kelly assumes perfect probability estimates. At 5%, a 2x overestimate of edge costs much less capital than full Kelly while still ranking larger edges above smaller ones.
 
 ## Settlement
 
@@ -122,8 +124,10 @@ All settings in `src/config.py`, overridable via `WETHR_` environment variables:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `WETHR_DB_PATH` | `../data/wethr.db` | Shared SQLite database path |
+| `WETHR_DATA_DIR` | `../data` | Shared data directory |
 | `WETHR_MIN_EDGE` | 0.08 | Minimum edge (8%) to trade |
-| `WETHR_KELLY_FRAC` | 0.15 | Fractional Kelly multiplier |
+| `WETHR_KELLY_FRAC` | 0.05 | Fractional Kelly multiplier |
 | `WETHR_MAX_TRADE` | 100.0 | Max USD per trade |
 | `WETHR_MAX_BANK_PCT` | 0.05 | Max % of bankroll per trade |
 | `WETHR_BANKROLL` | 10000.0 | Starting paper bankroll |
