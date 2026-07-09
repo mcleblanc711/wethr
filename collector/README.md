@@ -134,6 +134,11 @@ All settings in `src/config.py`, overridable via `WETHR_` environment variables:
 | `WETHR_DAILY_LOSS` | 300.0 | Daily loss circuit breaker |
 | `WETHR_SCAN_INTERVAL` | 300 | Seconds between scans |
 | `WETHR_LIVE` | 0 | Set to 1 for live trading |
+| `WETHR_TELEGRAM_BOT_TOKEN` | unset | Telegram bot token for new-position alerts |
+| `WETHR_TELEGRAM_CHAT_ID` | unset | Telegram chat ID for new-position alerts |
+| `WETHR_TELEGRAM_MESSAGE_THREAD_ID` | unset | Optional topic/thread ID for forum chats |
+
+`TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are also accepted as aliases.
 
 ## Live trading
 

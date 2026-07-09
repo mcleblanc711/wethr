@@ -197,3 +197,16 @@ MIN_ENSEMBLE_CONFIDENCE = float(os.getenv("WETHR_MIN_CONFIDENCE", "0.60"))
 HTTP_TIMEOUT = 30  # seconds
 HTTP_RETRIES = 3
 USER_AGENT = "wethr-agent/0.1"
+
+# ---------------------------------------------------------------------------
+# Telegram notifications
+# ---------------------------------------------------------------------------
+TELEGRAM_BOT_TOKEN = (
+    os.getenv("WETHR_TELEGRAM_BOT_TOKEN")
+    or os.getenv("TELEGRAM_BOT_TOKEN", "")
+)
+TELEGRAM_CHAT_ID = (
+    os.getenv("WETHR_TELEGRAM_CHAT_ID")
+    or os.getenv("TELEGRAM_CHAT_ID", "")
+)
+TELEGRAM_MESSAGE_THREAD_ID = os.getenv("WETHR_TELEGRAM_MESSAGE_THREAD_ID", "")

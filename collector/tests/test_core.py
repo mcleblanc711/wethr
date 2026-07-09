@@ -46,6 +46,7 @@ from src.probability import count_members_in_bracket, BracketProbability
 from src.sizing import calculate_kelly, size_position
 from src.ensemble import c_to_f, EnsembleMember, EnsembleForecast
 from src.paper_trader import init_db, record_paper_trade, settle_trade, get_stats, get_calibration_data
+from src.telegram import build_trade_opened_message
 
 
 # ===================================================================
@@ -720,6 +721,38 @@ def test_bracket_has_no_token_field():
     )
     assert b.no_token_id == "no456"
     assert b.token_id == "yes123"
+
+
+def test_trade_opened_telegram_message():
+    """New-position Telegram messages should show the trade details."""
+    from src.markets import Bracket
+
+    bracket = Bracket(
+        token_id="yes123", label="72°F - 74°F",
+        lower=72, upper=74, unit="F", market_prob=0.20,
+        condition_id="c1", no_token_id="no456",
+    )
+    bp = BracketProbability(
+        bracket=bracket, model_prob=0.35, market_prob=0.20,
+        edge=0.15, member_count=50, total_members=143, confidence=0.70,
+    )
+    ps = size_position(bp, bankroll=10000.0)
+
+    message = build_trade_opened_message(
+        trade_id=42,
+        city="nyc",
+        target_date=date(2026, 3, 22),
+        ps=ps,
+        market_volume=12345,
+        pending_count=3,
+    )
+
+    assert "New Wethr position" in message
+    assert "#42 New York City 2026-03-22" in message
+    assert "72°F - 74°F YES @ 0.20" in message
+    assert "Size: $" in message
+    assert "Edge: +15.0%" in message
+    assert "Open positions: 3" in message
 
 
 # ===================================================================

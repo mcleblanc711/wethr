@@ -37,6 +37,7 @@ from .paper_trader import (
     print_report,
 )
 from .settlement import settle_date, settle_yesterday
+from .telegram import notify_trade_opened
 from .trading import TradingClient
 
 logging.basicConfig(
@@ -203,6 +204,15 @@ async def scan_and_trade(
                 if tid is not None:
                     trade_ids.append(tid)
                     pending += 1
+                    await notify_trade_opened(
+                        client,
+                        trade_id=tid,
+                        city=market.city,
+                        target_date=market.target_date,
+                        ps=ps,
+                        market_volume=market.total_volume,
+                        pending_count=pending,
+                    )
 
                     # Live trade (if client provided and live mode on)
                     if trading_client and trading_client.is_live:

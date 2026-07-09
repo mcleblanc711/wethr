@@ -7,6 +7,10 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/projects/wethr/collector
 Environment=WETHR_LIVE=0
+# Optional: send new-position alerts to Telegram.
+# Environment=WETHR_TELEGRAM_BOT_TOKEN=
+# Environment=WETHR_TELEGRAM_CHAT_ID=
+# Environment=WETHR_TELEGRAM_MESSAGE_THREAD_ID=
 ExecStart=/usr/bin/python3 %h/projects/wethr/collector/run.py loop
 Restart=always
 RestartSec=30
