@@ -37,7 +37,7 @@ from src.calibration import (
     crps_gaussian,
 )
 from src.ensemble import c_to_f
-from src.paper_trader import get_db
+from src.paper_trader import get_db, init_db
 
 logging.basicConfig(
     level=logging.INFO,
@@ -349,6 +349,11 @@ def main():
     parser.add_argument("--combined", action="store_true",
                         help="Combine signal + history data")
     args = parser.parse_args()
+
+    # Apply pending migrations first. The history queries reference columns
+    # added by the calibration ledger, so on a database that has not been
+    # opened by init_db since the migration they would raise "no such column".
+    init_db()
 
     # Extract data
     if args.combined:

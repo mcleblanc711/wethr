@@ -87,7 +87,15 @@ def extract_resolution_metadata(event: dict, city_slug: str) -> tuple[str, str |
     elif "nearest whole" in lower or "whole degree" in lower or "integer" in lower:
         precision = 1.0
     else:
+        # Deliberately not inferred from CityConfig: guessing the rounding rule
+        # would silently decide whether station truth matches the winning
+        # bracket. Surface it so the market can be fixed or excluded — the
+        # count is reported by collection_status as missing_resolution_metadata.
         precision = None
+        log.warning(
+            f"No declared rounding precision for {city_slug}; market cannot "
+            f"reconcile against station truth until the rule is known"
+        )
     return resolution_url, declared_station, precision
 
 

@@ -117,9 +117,13 @@ CREATE INDEX IF NOT EXISTS idx_signals_date ON signals(target_date);
 def get_db(db_path: Path | None = None) -> Generator[sqlite3.Connection, None, None]:
     """Context manager for database connections."""
     path = db_path or config.DB_PATH
-    conn = sqlite3.connect(str(path))
+    # WAL allows concurrent readers but still serialises writers, and the loop
+    # service now shares this file with two calibration timers, so wait for the
+    # lock instead of failing the scan outright.
+    conn = sqlite3.connect(str(path), timeout=config.DB_BUSY_TIMEOUT_S)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute(f"PRAGMA busy_timeout={int(config.DB_BUSY_TIMEOUT_S * 1000)}")
     conn.execute("PRAGMA foreign_keys=ON")
     try:
         yield conn
@@ -138,15 +142,8 @@ def _add_column_if_missing(
     ddl: str,
 ) -> None:
     """Add a SQLite column, tolerating concurrent init_db calls."""
-    cols = [r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
-    if column in cols:
-        return
-    try:
-        conn.execute(ddl)
-    except sqlite3.OperationalError as exc:
-        if "duplicate column name" in str(exc).lower():
-            return
-        raise
+    from .ledger import add_column_if_missing
+    add_column_if_missing(conn, table, column, ddl)
 
 
 def init_db(db_path: Path | None = None) -> None:

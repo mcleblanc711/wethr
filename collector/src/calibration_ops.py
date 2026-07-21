@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import math
 import shutil
 import sqlite3
@@ -41,19 +42,46 @@ from .markets import extract_resolution_metadata, match_city, parse_bracket_labe
 from .paper_trader import get_db, init_db
 from .settlement import fetch_resolved_weather_events
 
+log = logging.getLogger(__name__)
+
 PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 AVIATION_WEATHER_URL = "https://aviationweather.gov/api/data/metar"
 LEAD_BUCKETS = ("in_day", "0_24h", "24_48h", "48_72h", "72h_plus")
+# Beyond this age an unresolved market is abandoned rather than retried forever.
+UNRESOLVED_RETRY_DAYS = 30
+
+
+def _parse_timestamp(value: Any, *, assume_utc: bool = False) -> datetime | None:
+    """Parse a provider timestamp, or return None.
+
+    Never substitutes a stand-in time: an observation stamped with the moment we
+    happened to fetch it is not an observation, and silently recording one
+    corrupts every lead and local-day calculation downstream.  ``assume_utc`` is
+    only for providers that document naive timestamps as UTC.
+    """
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        return parse_utc(text)
+    except ValueError:
+        pass
+    if not assume_utc:
+        return None
+    try:
+        naive = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    return naive.replace(tzinfo=timezone.utc) if naive.tzinfo is None else naive.astimezone(timezone.utc)
 
 
 def _dt(value: Any, fallback: datetime | None = None) -> datetime:
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, tz=timezone.utc)
-    if isinstance(value, str) and value:
-        try:
-            return parse_utc(value)
-        except ValueError:
-            pass
+    """Parse a timestamp, falling back only where the caller has a defensible default."""
+    parsed = _parse_timestamp(value)
+    if parsed is not None:
+        return parsed
     return fallback or utc_now()
 
 
@@ -78,20 +106,23 @@ async def collect_prospective_forecasts(
                             ForecastSnapshotInput(
                                 city=city,
                                 target_date=target,
-                                # Capture time is a verified information cutoff. The
-                                # provider run time is not invented when absent.
-                                issued_at=seen,
                                 seen_at=seen,
                                 provider="open-meteo-ensemble",
                                 model=model,
                                 members_c=values,
                                 source_endpoint=config.ENSEMBLE_API_BASE,
-                                issue_time_verified=True,
-                                quality_detail="prospective capture cutoff; provider run time not asserted",
+                                # The Ensemble API does not expose a run time, so
+                                # the capture cutoff is the lead basis and the row
+                                # records issue_time_verified=0.
+                                run_time=None,
+                                quality_detail="prospective capture cutoff; provider run time not exposed by endpoint",
                             ),
                         )
-                    except ValueError:
+                    except ValueError as exc:
                         failed += 1
+                        log.warning(
+                            f"Rejected {model} forecast for {city} {target}: {exc}"
+                        )
                     else:
                         inserted += int(created)
                         unchanged += int(not created)
@@ -204,8 +235,8 @@ async def collect_nws_observations(
                 station_id=city.station, declared_precision=1.0,
                 rounded_unit=city.temp_unit,
             )
-        except ValueError:
-            pass
+        except ValueError as exc:
+            log.info(f"NWS {city_slug} {target}: no daily observation ({exc})")
     return inserted
 
 
@@ -232,12 +263,20 @@ async def collect_metar_observations(
         data = response.json()
         if not isinstance(data, list):
             data = []
+        unparseable = 0
         for item in data:
-            stamp = item.get("reportTime") or item.get("obsTime")
+            # obsTime is an unambiguous epoch; reportTime is a naive UTC string,
+            # so prefer the former and only ever treat the latter as UTC.
+            stamp = item.get("obsTime")
+            if stamp is None:
+                stamp = item.get("reportTime")
             temp = item.get("temp")
             if stamp is None or temp is None:
                 continue
-            observed = _dt(stamp)
+            observed = _parse_timestamp(stamp, assume_utc=True)
+            if observed is None:
+                unparseable += 1
+                continue
             if observed.astimezone(ZoneInfo(city.timezone)).date() != target:
                 continue
             _, created = record_station_observation(
@@ -254,14 +293,19 @@ async def collect_metar_observations(
                 raw=item,
             )
             inserted += int(created)
+        if unparseable:
+            log.warning(
+                f"METAR {city_slug} {target}: dropped {unparseable} readings with "
+                f"unparseable timestamps"
+            )
         try:
             aggregate_daily_observation(
                 conn, city=city_slug, target_date=target,
                 provider="aviationweather-metar", station_id=city.station,
                 declared_precision=1.0, rounded_unit=city.temp_unit,
             )
-        except ValueError:
-            pass
+        except ValueError as exc:
+            log.info(f"METAR {city_slug} {target}: no daily observation ({exc})")
     return inserted
 
 
@@ -297,6 +341,12 @@ async def collect_gamma_resolutions(
                 if len(prices) >= 2 and float(prices[0]) > 0.5:
                     winners.append(market)
             if len(winners) != 1:
+                # 0 winners = not fully resolved yet; 2+ = contradictory Gamma
+                # data. Either way, never guess which bracket won.
+                log.warning(
+                    f"Gamma resolution for {city_slug} {target} has {len(winners)} "
+                    f"winning markets; skipped (event {event.get('id')})"
+                )
                 continue
             winner = winners[0]
             label = winner.get("groupItemTitle") or winner.get("question") or ""
@@ -401,20 +451,52 @@ def reconcile_all(target: date | None = None, db_path: Path | None = None) -> di
     return dict(counts)
 
 
-def unresolved_target_dates(db_path: Path | None = None) -> list[date]:
+_UNRESOLVED_SQL = """
+    SELECT DISTINCT x.target_date FROM (
+        SELECT target_date FROM trades WHERE settled=0
+        UNION SELECT target_date FROM signals WHERE outcome IS NULL
+    ) x
+    LEFT JOIN market_resolutions r ON r.target_date=x.target_date
+    WHERE r.id IS NULL AND x.target_date {comparison} ?
+    ORDER BY x.target_date
+"""
+
+
+def _unresolved(
+    db_path: Path | None,
+    comparison: str,
+    max_age_days: int,
+    now: datetime | None = None,
+) -> list[date]:
+    cutoff = ((now or utc_now()).date() - timedelta(days=max_age_days)).isoformat()
     with get_db(db_path) as conn:
         rows = conn.execute(
-            """
-            SELECT DISTINCT x.target_date FROM (
-                SELECT target_date FROM trades WHERE settled=0
-                UNION SELECT target_date FROM signals WHERE outcome IS NULL
-            ) x
-            LEFT JOIN market_resolutions r ON r.target_date=x.target_date
-            WHERE r.id IS NULL
-            ORDER BY x.target_date
-            """
+            _UNRESOLVED_SQL.format(comparison=comparison), (cutoff,)
         ).fetchall()
     return [date.fromisoformat(row["target_date"]) for row in rows]
+
+
+def unresolved_target_dates(
+    db_path: Path | None = None,
+    max_age_days: int = UNRESOLVED_RETRY_DAYS,
+    now: datetime | None = None,
+) -> list[date]:
+    """Dates still worth retrying.
+
+    Some markets never resolve on Gamma. Retrying them forever grows the daily
+    sweep without bound — every entry costs a full round of network calls — so
+    the window is capped and older dates move to ``abandoned_target_dates``.
+    """
+    return _unresolved(db_path, ">=", max_age_days, now)
+
+
+def abandoned_target_dates(
+    db_path: Path | None = None,
+    max_age_days: int = UNRESOLVED_RETRY_DAYS,
+    now: datetime | None = None,
+) -> list[date]:
+    """Unresolved dates past the retry window: reported once, no longer retried."""
+    return _unresolved(db_path, "<", max_age_days, now)
 
 
 def collection_status(db_path: Path | None = None, now: datetime | None = None) -> dict[str, Any]:
@@ -430,9 +512,16 @@ def collection_status(db_path: Path | None = None, now: datetime | None = None) 
                  SELECT MAX(id) FROM forecast_snapshots GROUP BY city, model
                ) ORDER BY model"""
         ).fetchall()
-        unresolved = unresolved_target_dates(db_path)
+        unresolved = unresolved_target_dates(db_path, now=now)
+        abandoned = abandoned_target_dates(db_path, now=now)
         discrepancies = int(conn.execute(
             "SELECT COUNT(*) AS n FROM market_resolutions WHERE reconciliation_status='discrepancy'"
+        ).fetchone()["n"])
+        # Markets whose rounding rule or station was never declared can never
+        # reconcile, so they need to be visible rather than silently stuck.
+        missing_metadata = int(conn.execute(
+            """SELECT COUNT(*) AS n FROM market_resolutions
+               WHERE reconciliation_status='missing_resolution_metadata'"""
         ).fetchone()["n"])
         models = [dict(row) for row in conn.execute(
             "SELECT id,status,algorithm,lead_bucket,created_at FROM model_versions ORDER BY created_at"
@@ -462,7 +551,9 @@ def collection_status(db_path: Path | None = None, now: datetime | None = None) 
         "member_count_failures": expected_missing,
         "unresolved_dates": [d.isoformat() for d in unresolved],
         "unresolved_older_than_3d": old_unresolved,
+        "abandoned_dates": [d.isoformat() for d in abandoned],
         "reconciliation_discrepancies": discrepancies,
+        "missing_resolution_metadata": missing_metadata,
         "models": models,
         "scan_coverage_7d": captured / expected if expected else 0.0,
         "scan_days_7d": int(recent_runs["days"] or 0),
@@ -510,28 +601,158 @@ def _training_data(rows: Sequence[sqlite3.Row]) -> TrainingData:
     )
 
 
-def _rolling_metrics(rows: Sequence[sqlite3.Row], scope: str) -> dict[str, Any]:
+def _score_rows(
+    params: EMOSParams, rows: Sequence[sqlite3.Row]
+) -> tuple[list[float], list[float]]:
+    candidate: list[float] = []
+    raw: list[float] = []
+    for row in rows:
+        obs = float(row["max_temperature_c"])
+        mu, sigma = params.predict(float(row["mean_c"]), float(row["std_c"]))
+        candidate.append(crps_gaussian(mu, sigma, obs))
+        raw.append(crps_gaussian(float(row["mean_c"]), max(float(row["std_c"]), .1), obs))
+    return candidate, raw
+
+
+def _rolling_scores(rows: Sequence[sqlite3.Row], scope: str) -> dict[str, Any]:
+    """Expanding-window CRPS plus a scored holdout, for one model scope."""
     dates = [date.fromisoformat(row["target_date"]) for row in rows]
     splits, holdout = chronological_rolling_splits(dates)
-    candidate_scores: list[float] = []
-    raw_scores: list[float] = []
+    candidate: list[float] = []
+    raw: list[float] = []
     for train_dates, validation_dates in splits:
         train_rows = [r for r in rows if date.fromisoformat(r["target_date"]) in train_dates]
         validation_rows = [r for r in rows if date.fromisoformat(r["target_date"]) in validation_dates]
         if len(train_rows) < 10 or not validation_rows:
             continue
-        params = train_emos(_training_data(train_rows), city=scope)
-        for row in validation_rows:
-            obs = float(row["max_temperature_c"])
-            mu, sigma = params.predict(float(row["mean_c"]), float(row["std_c"]))
-            candidate_scores.append(crps_gaussian(mu, sigma, obs))
-            raw_scores.append(crps_gaussian(float(row["mean_c"]), max(float(row["std_c"]), .1), obs))
+        fold_candidate, fold_raw = _score_rows(
+            train_emos(_training_data(train_rows), city=scope), validation_rows
+        )
+        candidate += fold_candidate
+        raw += fold_raw
+    # The reserved holdout is scored rather than merely set aside: fit once on
+    # everything preceding it, then predict it.
+    holdout_candidate: list[float] = []
+    holdout_raw: list[float] = []
+    development = [r for r in rows if date.fromisoformat(r["target_date"]) not in holdout]
+    holdout_rows = [r for r in rows if date.fromisoformat(r["target_date"]) in holdout]
+    if len(development) >= 10 and holdout_rows:
+        holdout_candidate, holdout_raw = _score_rows(
+            train_emos(_training_data(development), city=scope), holdout_rows
+        )
     return {
-        "rolling_folds": len(splits),
-        "validation_crps": float(np.mean(candidate_scores)) if candidate_scores else None,
-        "raw_validation_crps": float(np.mean(raw_scores)) if raw_scores else None,
+        "candidate": candidate, "raw": raw, "folds": len(splits),
+        "holdout_candidate": holdout_candidate, "holdout_raw": holdout_raw,
+        "holdout": holdout,
+    }
+
+
+def _rolling_metrics(groups: dict[str, Sequence[sqlite3.Row]]) -> dict[str, Any]:
+    """Validate each stored model with its own CV, then pool the scores.
+
+    Scoring one pooled model while storing per-city models would report metrics
+    for a model that is never served, so every scope in ``groups`` is validated
+    with exactly the model that scope will use.
+    """
+    candidate: list[float] = []
+    raw: list[float] = []
+    holdout_candidate: list[float] = []
+    holdout_raw: list[float] = []
+    folds = 0
+    holdout: set[date] = set()
+    per_scope: dict[str, float] = {}
+    for scope, rows in sorted(groups.items()):
+        scored = _rolling_scores(rows, scope)
+        candidate += scored["candidate"]
+        raw += scored["raw"]
+        holdout_candidate += scored["holdout_candidate"]
+        holdout_raw += scored["holdout_raw"]
+        folds = max(folds, scored["folds"])
+        holdout |= scored["holdout"]
+        if scored["candidate"]:
+            per_scope[scope] = float(np.mean(scored["candidate"]))
+
+    def mean_or_none(values: Sequence[float]) -> float | None:
+        return float(np.mean(values)) if values else None
+
+    return {
+        "rolling_folds": folds,
+        "validation_scopes": sorted(groups),
+        "validation_crps": mean_or_none(candidate),
+        "raw_validation_crps": mean_or_none(raw),
+        "per_scope_validation_crps": per_scope,
+        "holdout_crps": mean_or_none(holdout_candidate),
+        "raw_holdout_crps": mean_or_none(holdout_raw),
         "holdout_dates": len(holdout),
         "holdout_start": min(holdout).isoformat() if holdout else None,
+    }
+
+
+def dataset_quality(
+    conn: sqlite3.Connection, snapshot_ids: Sequence[int]
+) -> dict[str, Any]:
+    """Measure provenance, reconciliation, and completeness from the ledger.
+
+    These feed promotion gates, so they are measured rather than asserted: a
+    gate seeded with a literal ``True`` is not a gate.
+    """
+    empty = {
+        "provenance_complete": False,
+        "provenance_missing": 0,
+        "reconciliation_checks_pass": False,
+        "reconciliation_discrepancies": 0,
+        "data_completeness": 0.0,
+        "resolutions_in_window": 0,
+        "covered_city_days": 0,
+    }
+    if not snapshot_ids:
+        return empty
+    ids = [int(v) for v in snapshot_ids]
+    placeholders = ",".join("?" * len(ids))
+    provenance = conn.execute(
+        f"""SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN city IS NULL OR target_date IS NULL OR provider IS NULL
+                                 OR model IS NULL OR source_endpoint IS NULL
+                                 OR canonical_hash IS NULL OR issued_at IS NULL
+                                 OR lead_basis IS NULL OR lead_basis NOT IN
+                                    ('run_time','capture_cutoff')
+                            THEN 1 ELSE 0 END) AS missing
+            FROM forecast_snapshots WHERE id IN ({placeholders})""",
+        ids,
+    ).fetchone()
+    if not provenance["total"]:
+        return empty
+    window = conn.execute(
+        f"""SELECT MIN(target_date) AS first, MAX(target_date) AS last
+            FROM forecast_snapshots WHERE id IN ({placeholders})""",
+        ids,
+    ).fetchone()
+    resolutions = conn.execute(
+        """SELECT COUNT(DISTINCT city || '|' || target_date) AS total,
+                  SUM(CASE WHEN reconciliation_status='discrepancy' THEN 1 ELSE 0 END) AS bad
+           FROM market_resolutions WHERE target_date BETWEEN ? AND ?""",
+        (window["first"], window["last"]),
+    ).fetchone()
+    covered = int(conn.execute(
+        f"""SELECT COUNT(DISTINCT city || '|' || target_date) AS n
+            FROM forecast_snapshots WHERE id IN ({placeholders})""",
+        ids,
+    ).fetchone()["n"])
+    resolved_city_days = int(resolutions["total"] or 0)
+    discrepancies = int(resolutions["bad"] or 0)
+    return {
+        # Every training row carries a full provenance chain.
+        "provenance_complete": not int(provenance["missing"] or 0),
+        "provenance_missing": int(provenance["missing"] or 0),
+        # No resolved market in the window disagrees with station truth.
+        "reconciliation_checks_pass": discrepancies == 0 and resolved_city_days > 0,
+        "reconciliation_discrepancies": discrepancies,
+        # What fraction of resolved city-days in the window we can actually train on.
+        "data_completeness": (
+            min(covered / resolved_city_days, 1.0) if resolved_city_days else 0.0
+        ),
+        "resolutions_in_window": resolved_city_days,
+        "covered_city_days": covered,
     }
 
 
@@ -555,13 +776,12 @@ def train_candidate(lead: str | None = None, db_path: Path | None = None) -> str
         grouped_rows = [row for city_rows in included_group.values() for row in city_rows]
         grouped_dates = {row["target_date"] for row in grouped_rows}
         parameters: dict[str, Any] = {"city": {}, "grouped": None}
+        snapshot_ids = [int(row["id"]) for row in rows]
         metrics: dict[str, Any] = {
-            "provenance_complete": True,
-            "reconciliation_checks_pass": True,
-            "data_completeness": 1.0 if rows else 0.0,
             "resolved_dates": len({row["target_date"] for row in rows}),
             "independent_city_days": len(rows),
-            "segment_max_degradation": 0.0,
+            # Measured against the ledger, never asserted.
+            **dataset_quality(conn, snapshot_ids),
         }
         algorithm = "raw-ensemble-fallback"
         for city, city_rows in eligible_city.items():
@@ -569,12 +789,12 @@ def train_candidate(lead: str | None = None, db_path: Path | None = None) -> str
             parameters["city"][city] = params.to_dict()
         if eligible_city:
             algorithm = "emos-city"
-            metrics.update(_rolling_metrics([r for rs in eligible_city.values() for r in rs], "city"))
+            metrics.update(_rolling_metrics(eligible_city))
         elif len(grouped_rows) >= 120 and len(grouped_dates) >= 60:
             params = train_emos(_training_data(grouped_rows), city="grouped")
             parameters["grouped"] = params.to_dict()
             algorithm = "emos-grouped"
-            metrics.update(_rolling_metrics(grouped_rows, "grouped"))
+            metrics.update(_rolling_metrics({"grouped": grouped_rows}))
         else:
             metrics.update({"rolling_folds": 0, "validation_crps": None, "raw_validation_crps": None, "holdout_dates": 0})
         raw_crps = metrics.get("raw_validation_crps")
@@ -583,7 +803,6 @@ def train_candidate(lead: str | None = None, db_path: Path | None = None) -> str
             (raw_crps - model_crps) / raw_crps
             if raw_crps and model_crps is not None else 0.0
         )
-        snapshot_ids = [int(row["id"]) for row in rows]
         manifest = {
             "forecast_snapshot_ids": snapshot_ids,
             "row_count": len(rows),
@@ -713,7 +932,11 @@ def evaluate_model(model_version: str, db_path: Path | None = None) -> dict[str,
                    r.winning_lower,r.winning_upper,r.winning_unit
             FROM prediction_snapshots p
             JOIN market_snapshots m ON m.id=p.market_snapshot_id
-            JOIN market_resolutions r ON r.city=m.city AND r.target_date=m.target_date
+            JOIN market_resolutions r ON r.id = (
+                SELECT r2.id FROM market_resolutions r2
+                WHERE r2.city=m.city AND r2.target_date=m.target_date
+                ORDER BY r2.resolved_at ASC, r2.id ASC LIMIT 1
+            )
             WHERE p.model_version_id=? AND p.generated_at < r.resolved_at
             """,
             (model_version,),
@@ -779,6 +1002,9 @@ def evaluate_model(model_version: str, db_path: Path | None = None) -> dict[str,
                 degradations.append((candidate_brier - control_brier) / control_brier)
         metrics = json.loads(model["metrics_json"])
         acceptance = operational_acceptance(conn)
+        # Re-measure data quality now rather than trusting what training wrote:
+        # the ledger may have gained discrepancies since the candidate was built.
+        manifest = json.loads(model["dataset_manifest_json"] or "{}")
         metrics.update({
             "gamma": candidate,
             "raw_gamma": raw,
@@ -789,10 +1015,22 @@ def evaluate_model(model_version: str, db_path: Path | None = None) -> dict[str,
             "independent_city_days": len(city_days),
             "collection_acceptance": acceptance,
             "archive_verified": acceptance["archive_verified"],
+            **dataset_quality(conn, manifest.get("forecast_snapshot_ids", [])),
         })
+        # Elapsed shadow time, so a backfill cannot satisfy the duration gate by
+        # importing history in a single afternoon.
+        now = utc_now()
+        shadow_since = model["shadow_since"] or iso_utc(now)
+        metrics["shadow_days"] = (now - parse_utc(shadow_since)).total_seconds() / 86400.0
         conn.execute(
-            "UPDATE model_versions SET metrics_json=?, status=CASE WHEN status='candidate' THEN 'shadow' ELSE status END WHERE id=?",
-            (canonical_json(metrics), model_version),
+            """
+            UPDATE model_versions
+            SET metrics_json=?,
+                status=CASE WHEN status='candidate' THEN 'shadow' ELSE status END,
+                shadow_since=COALESCE(shadow_since, ?)
+            WHERE id=?
+            """,
+            (canonical_json(metrics), shadow_since, model_version),
         )
     return metrics
 
@@ -812,11 +1050,17 @@ def promotion_gates(candidate_metrics: dict[str, Any], control_metrics: dict[str
             and math.isfinite(candidate) and math.isfinite(baseline) and candidate <= baseline
         )
     return {
-        "shadow_duration": candidate_metrics.get("resolved_dates", 0) >= 28,
+        "shadow_duration": (
+            candidate_metrics.get("resolved_dates", 0) >= 28
+            and candidate_metrics.get("shadow_days", 0) >= 28
+        ),
         "shadow_sample": candidate_metrics.get("independent_city_days", 0) >= 60,
         "brier_vs_raw": improves(gamma.get("brier"), raw.get("brier")),
         "brier_vs_control": improves(gamma.get("brier"), control_gamma.get("brier")),
         "crps_vs_raw": candidate_metrics.get("crps_improvement_vs_raw", 0) >= .02,
+        "holdout_not_worse_than_raw": nonworse(
+            candidate_metrics.get("holdout_crps"), candidate_metrics.get("raw_holdout_crps")
+        ),
         "log_loss_nonworse": nonworse(gamma.get("log_loss"), control_gamma.get("log_loss")),
         "reliability_nonworse": nonworse(gamma.get("reliability_error"), control_gamma.get("reliability_error")),
         "segments": candidate_metrics.get("segment_max_degradation", math.inf) <= .05,
@@ -889,7 +1133,14 @@ def archive_month(month: str, db_path: Path | None = None, out_dir: Path | None 
     datetime.strptime(month, "%Y-%m")
     output = out_dir or config.DATA_DIR / "archive" / month
     output.mkdir(parents=True, exist_ok=True)
-    manifest: dict[str, Any] = {"month": month, "schema_version": SCHEMA_VERSION, "tables": {}}
+    manifest_path = output / "manifest.json"
+    previous: dict[str, Any] | None = None
+    if manifest_path.exists():
+        try:
+            previous = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            previous = None
+    revision = int((previous or {}).get("revision", 0)) + 1
     date_columns = {
         "forecast_snapshots": "target_date", "market_snapshots": "target_date",
         "prediction_snapshots": "generated_at", "station_observations": "observed_at",
@@ -897,32 +1148,62 @@ def archive_month(month: str, db_path: Path | None = None, out_dir: Path | None 
         "model_versions": "created_at", "model_transitions": "changed_at",
         "collection_runs": "started_at",
     }
+    revision_dir = output / f"r{revision}"
+    revision_dir.mkdir(parents=True, exist_ok=True)
+    tables: dict[str, Any] = {}
     with get_db(db_path) as conn:
+        # A month is only finalizable once every resolution in it has been
+        # reconciled; archiving earlier bakes in a partition we know is unfinished.
+        pending = int(conn.execute(
+            """SELECT COUNT(*) AS n FROM market_resolutions
+               WHERE substr(target_date,1,7)=? AND reconciliation_status='pending'""",
+            (month,),
+        ).fetchone()["n"])
+        if pending:
+            raise RuntimeError(
+                f"{month} still has {pending} unreconciled resolutions; "
+                "run reconcile before archiving"
+            )
         for table, column in date_columns.items():
             rows = [dict(row) for row in conn.execute(
                 f"SELECT * FROM {table} WHERE substr({column},1,7)=? ORDER BY 1", (month,)
             ).fetchall()]
-            destination = output / f"{table}.parquet"
+            # Independent count: catches a concurrent writer mutating the
+            # partition midway through the export.
+            expected = int(conn.execute(
+                f"SELECT COUNT(*) AS n FROM {table} WHERE substr({column},1,7)=?", (month,)
+            ).fetchone()["n"])
+            if expected != len(rows):
+                raise RuntimeError(
+                    f"{table} changed during archive: exported {len(rows)}, database has {expected}"
+                )
+            destination = revision_dir / f"{table}.parquet"
             table_data = pa.Table.from_pylist(rows) if rows else pa.table({"_empty": pa.array([], type=pa.null())})
-            temporary = destination.with_suffix(".parquet.tmp")
-            pq.write_table(table_data, temporary, compression="zstd")
-            digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
-            if destination.exists() and hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
-                temporary.unlink()
-                raise RuntimeError(f"immutable archive conflict: {destination}")
-            temporary.replace(destination)
-            verified = pq.read_table(destination).num_rows
-            expected = len(rows)
-            if expected == 0:
-                verified = 0
+            pq.write_table(table_data, destination, compression="zstd")
+            verified = pq.read_table(destination).num_rows if rows else 0
             if verified != expected:
                 raise RuntimeError(f"archive row-count mismatch for {table}: {verified} != {expected}")
-            manifest["tables"][table] = {"rows": expected, "sha256": digest, "file": destination.name}
-    manifest_path = output / "manifest.json"
-    encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
-    if manifest_path.exists() and manifest_path.read_bytes() != encoded:
-        raise RuntimeError(f"immutable archive conflict: {manifest_path}")
-    manifest_path.write_bytes(encoded)
+            tables[table] = {
+                "rows": expected,
+                "sha256": hashlib.sha256(destination.read_bytes()).hexdigest(),
+                "file": f"r{revision}/{table}.parquet",
+            }
+
+    def content(spec: dict[str, Any]) -> dict[str, tuple[int, str]]:
+        return {name: (item["rows"], item["sha256"]) for name, item in spec.items()}
+
+    # Unchanged re-runs are a no-op, so the job stays idempotent. Genuine
+    # changes — a late resolution, a corrected reconciliation — become a new
+    # revision instead of a permanent hard failure that kills the monthly job.
+    if previous and content(previous.get("tables", {})) == content(tables):
+        shutil.rmtree(revision_dir)
+        return manifest_path
+    manifest = {
+        "month": month, "schema_version": SCHEMA_VERSION, "revision": revision,
+        "tables": tables,
+        "supersedes": (previous or {}).get("revision"),
+    }
+    manifest_path.write_bytes((json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode())
     return manifest_path
 
 
@@ -949,6 +1230,7 @@ def migrate_legacy_inventory(
     shutil.copy2(primary, backup_dir / f"wethr-primary-pre-legacy-{stamp}.db")
     shutil.copy2(legacy, backup_dir / f"wethr-secondary-pre-legacy-{stamp}.db")
     copied: dict[str, int] = {}
+    skipped: dict[str, str] = {}
     with get_db(primary) as conn:
         conn.execute("ATTACH DATABASE ? AS legacy", (str(legacy),))
         for table, key_cols in {
@@ -960,14 +1242,34 @@ def migrate_legacy_inventory(
             target_cols = [row[1] for row in conn.execute(f"PRAGMA main.table_info({table})") if row[1] != "id"]
             source_cols = {row[1] for row in conn.execute(f"PRAGMA legacy.table_info({table})")}
             common = [col for col in target_cols if col in source_cols]
+            if not common:
+                # The table is absent from one side — the history tables are
+                # created lazily — which would otherwise build a malformed
+                # "INSERT INTO t () SELECT FROM ..." and fail the migration.
+                skipped[table] = "table missing or no shared columns"
+                copied[table] = 0
+                continue
             before = conn.total_changes
             cols = ",".join(common)
-            keys = " AND ".join(f"p.{key}=l.{key}" for key in key_cols)
+            # ``IS`` is NULL-safe in SQLite. Plain ``=`` yields NULL for a NULL
+            # key, making NOT EXISTS true and re-copying the same row on every
+            # run, which would silently break idempotency.
+            keys = " AND ".join(f"p.{key} IS l.{key}" for key in key_cols)
             conn.execute(
                 f"INSERT INTO main.{table} ({cols}) SELECT {','.join('l.'+c for c in common)} FROM legacy.{table} l WHERE NOT EXISTS (SELECT 1 FROM main.{table} p WHERE {keys})"
             )
             copied[table] = conn.total_changes - before
+        # Newly copied trades predate the ledger, so tag them as legacy control
+        # rows. init_calibration_ledger already ran, long before this copy.
+        conn.execute(
+            "UPDATE trades SET model_version_id=? WHERE model_version_id IS NULL",
+            (LEGACY_MODEL_VERSION,),
+        )
+        result["untagged_trades"] = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM trades WHERE model_version_id IS NULL"
+        ).fetchone()["n"])
     result["copied"] = copied
+    result["skipped"] = skipped
     return result
 
 
@@ -989,14 +1291,18 @@ def persist_pipeline_forecasts(
                             conn,
                             ForecastSnapshotInput(
                                 city=city, target_date=target,
-                                issued_at=forecast.fetch_time, seen_at=forecast.fetch_time,
+                                seen_at=forecast.fetch_time,
                                 provider="open-meteo-ensemble", model=model,
                                 members_c=values, source_endpoint=config.ENSEMBLE_API_BASE,
-                                issue_time_verified=True,
+                                run_time=None,
                                 quality_detail="prospective pipeline capture cutoff",
                             ),
                         )
-                    except ValueError:
+                    except ValueError as exc:
+                        log.warning(
+                            f"Pipeline forecast for {city} {target} model {model} "
+                            f"not persisted: {exc}"
+                        )
                         continue
                     result[(city, target)].append(snapshot_id)
     return result
@@ -1031,6 +1337,8 @@ async def persist_market_quotes(
     inserted = 0
     expected_markets = sum(len(market.brackets) for market in markets)
     captured_books = 0
+    book_failures = 0
+    quotes: list[tuple[Any, Any, float | None, float | None, float | None, float | None]] = []
     for market in markets:
         for bracket in market.brackets:
             yes_book = no_book = None
@@ -1049,34 +1357,48 @@ async def persist_market_quotes(
                     )
                     response.raise_for_status()
                     no_book = response.json()
-            except httpx.HTTPError:
-                pass
+            except httpx.HTTPError as exc:
+                book_failures += 1
+                log.warning(
+                    f"CLOB book fetch failed for {market.city} {bracket.label}: {exc!r}"
+                )
             yes_bid, yes_ask = _book_quote(yes_book)
             no_bid, no_ask = _book_quote(no_book)
             if yes_ask is not None and no_ask is not None:
                 captured_books += 1
+            quotes.append((market, bracket, yes_bid, yes_ask, no_bid, no_ask))
+
+    # One connection and one transaction for the whole scan, so a scan is
+    # persisted atomically rather than dribbling out per bracket while the
+    # network calls above are still in flight.
+    with get_db(db_path) as conn:
+        for market, bracket, yes_bid, yes_ask, no_bid, no_ask in quotes:
             spread = yes_ask - yes_bid if yes_ask is not None and yes_bid is not None else None
-            with get_db(db_path) as conn:
-                market_snapshot_id, created = record_market_snapshot(
-                    conn,
-                    captured_at=captured, condition_id=bracket.condition_id,
-                    event_id=market.event_id, city=market.city,
-                    target_date=market.target_date.isoformat(), bracket_label=bracket.label,
-                    bracket_lower=bracket.lower, bracket_upper=bracket.upper,
-                    bracket_unit=bracket.unit, yes_best_bid=yes_bid, yes_best_ask=yes_ask,
-                    no_best_bid=no_bid, no_best_ask=no_ask, midpoint=bracket.market_prob,
-                    last_price=bracket.market_prob, volume=market.total_volume,
-                    liquidity=None, spread=spread,
-                    resolution_url=market.resolution_url or f"https://polymarket.com/event/{market.event_slug}",
-                    declared_precision=market.declared_precision, source_endpoint="gamma+clob",
+            market_snapshot_id, created = record_market_snapshot(
+                conn,
+                captured_at=captured, condition_id=bracket.condition_id,
+                event_id=market.event_id, city=market.city,
+                target_date=market.target_date.isoformat(), bracket_label=bracket.label,
+                bracket_lower=bracket.lower, bracket_upper=bracket.upper,
+                bracket_unit=bracket.unit, yes_best_bid=yes_bid, yes_best_ask=yes_ask,
+                no_best_bid=no_bid, no_best_ask=no_ask, midpoint=bracket.market_prob,
+                last_price=bracket.market_prob, volume=market.total_volume,
+                liquidity=None, spread=spread,
+                resolution_url=market.resolution_url or f"https://polymarket.com/event/{market.event_slug}",
+                declared_precision=market.declared_precision, source_endpoint="gamma+clob",
+            )
+            inserted += int(created)
+            if forecasts and forecast_ids:
+                _materialize_predictions(
+                    conn, market, bracket, market_snapshot_id, captured,
+                    forecasts, forecast_ids, yes_ask, no_ask,
                 )
-                inserted += int(created)
-                if forecasts and forecast_ids:
-                    _materialize_predictions(
-                        conn, market, bracket, market_snapshot_id, captured,
-                        forecasts, forecast_ids, yes_ask, no_ask,
-                    )
     coverage = captured_books / expected_markets if expected_markets else 1.0
+    if coverage < .95:
+        log.warning(
+            f"Scan captured {captured_books}/{expected_markets} executable books "
+            f"({coverage:.1%}); {book_failures} book fetches failed"
+        )
     with get_db(db_path) as conn:
         conn.execute(
             """INSERT INTO collection_runs(
@@ -1085,7 +1407,7 @@ async def persist_market_quotes(
                ) VALUES(?,?,?,?,?,?,?,?)""",
             (iso_utc(captured), iso_utc(), expected_markets, captured_books, coverage,
              expected_markets - captured_books, "ok" if coverage >= .95 else "incomplete",
-             canonical_json({"source": "gamma+clob"})),
+             canonical_json({"source": "gamma+clob", "book_fetch_failures": book_failures})),
         )
     return inserted
 

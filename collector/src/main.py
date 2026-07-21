@@ -537,35 +537,19 @@ def main():
         asyncio.run(_run())
 
     elif args.command == "train":
-        from .history import collect_and_train, train_all_cities
-        if args.all:
-            results = asyncio.run(train_all_cities(args.days))
-            print(f"\nTrained EMOS for {len(results)} cities:")
-            for slug, params in results.items():
-                print(
-                    f"  {slug}: μ = {params.a:.3f} + {params.b:.3f}*mean, "
-                    f"σ = {params.c:.3f} + {params.d:.3f}*std, "
-                    f"CRPS = {params.crps_train:.4f} (n={params.n_training})"
-                )
-        elif args.city:
-            async def _run():
-                async with httpx.AsyncClient(
-                    headers={"User-Agent": config.USER_AGENT}, timeout=60,
-                ) as client:
-                    return await collect_and_train(client, args.city, args.days)
-            params = asyncio.run(_run())
-            if params:
-                print(
-                    f"\nEMOS for {args.city}: "
-                    f"μ = {params.a:.3f} + {params.b:.3f}*mean, "
-                    f"σ = {params.c:.3f} + {params.d:.3f}*std, "
-                    f"CRPS = {params.crps_train:.4f} (n={params.n_training})"
-                )
-            else:
-                print("Training failed — insufficient data")
-        else:
-            print("Specify --city NYC or --all")
-
+        # The historical_* tables are quarantined as legacy_unverified, so this
+        # path can only ever train on zero rows. Fail loudly rather than
+        # printing "Trained EMOS for 0 cities" as if it had succeeded.
+        print(
+            "`wethr train` is disabled: historical forecasts are quarantined as "
+            "legacy_unverified\nand cannot produce a trainable dataset.\n\n"
+            "Use the calibration pipeline instead:\n"
+            "  wethr train-candidate [--lead-bucket BUCKET]\n"
+            "  wethr evaluate MODEL_VERSION\n"
+            "  wethr promote MODEL_VERSION",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
     elif args.command == "emos":
         from .calibration import load_all_emos_params
         params_dict = load_all_emos_params()

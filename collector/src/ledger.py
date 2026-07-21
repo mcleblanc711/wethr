@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 
 from . import config
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 LEGACY_MODEL_VERSION = "legacy-emos-2026-04-08"
 LEGACY_PROVENANCE = "legacy-v0"
 QUALITY_OK = "ok"
@@ -51,6 +51,7 @@ CREATE TABLE IF NOT EXISTS model_versions (
     metrics_json TEXT NOT NULL,
     status TEXT NOT NULL CHECK(status IN ('candidate','shadow','active','retired')),
     predecessor_id TEXT REFERENCES model_versions(id),
+    shadow_since TEXT,
     activated_at TEXT,
     retired_at TEXT,
     schema_version INTEGER NOT NULL DEFAULT 1
@@ -65,6 +66,8 @@ CREATE TABLE IF NOT EXISTS forecast_snapshots (
     issued_at TEXT NOT NULL,
     first_seen_at TEXT NOT NULL,
     last_seen_at TEXT NOT NULL,
+    capture_cutoff_at TEXT,
+    lead_basis TEXT NOT NULL DEFAULT 'run_time',
     target_timezone TEXT NOT NULL,
     target_day_start_utc TEXT NOT NULL,
     lead_hours REAL NOT NULL,
@@ -319,9 +322,25 @@ def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}
 
 
-def _add_column(conn: sqlite3.Connection, table: str, column: str, ddl: str) -> None:
-    if column not in _column_names(conn, table):
+def add_column_if_missing(
+    conn: sqlite3.Connection, table: str, column: str, ddl: str
+) -> None:
+    """Add a SQLite column, tolerating a concurrent migration of the same table.
+
+    Two Wethr processes can call ``init_db`` at once — the loop service and a
+    calibration timer — so losing the race must be a no-op, not a crash.
+    """
+    if column in _column_names(conn, table):
+        return
+    try:
         conn.execute(ddl)
+    except sqlite3.OperationalError as exc:
+        if "duplicate column name" in str(exc).lower():
+            return
+        raise
+
+
+_add_column = add_column_if_missing
 
 
 def init_calibration_ledger(conn: sqlite3.Connection) -> None:
@@ -354,6 +373,20 @@ def init_calibration_ledger(conn: sqlite3.Connection) -> None:
             "ALTER TABLE historical_forecasts ADD COLUMN training_eligible INTEGER NOT NULL DEFAULT 0",
         )
     conn.executescript(_SCHEMA)
+    # Schema v2: separate the capture cutoff from a verified provider run time.
+    _add_column(
+        conn, "forecast_snapshots", "capture_cutoff_at",
+        "ALTER TABLE forecast_snapshots ADD COLUMN capture_cutoff_at TEXT",
+    )
+    # Rows written before v2 asserted a verified issue time they did not have.
+    _add_column(
+        conn, "forecast_snapshots", "lead_basis",
+        "ALTER TABLE forecast_snapshots ADD COLUMN lead_basis TEXT NOT NULL DEFAULT 'unknown'",
+    )
+    _add_column(
+        conn, "model_versions", "shadow_since",
+        "ALTER TABLE model_versions ADD COLUMN shadow_since TEXT",
+    )
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS collection_runs (
@@ -410,17 +443,43 @@ def init_calibration_ledger(conn: sqlite3.Connection) -> None:
 
 @dataclass(frozen=True)
 class ForecastSnapshotInput:
+    """A forecast capture.
+
+    ``run_time`` is the provider's model run time and must only be set when it
+    was actually read from the response.  When it is absent the capture time is
+    the sole defensible information cutoff: the row records
+    ``lead_basis='capture_cutoff'`` and ``issue_time_verified=0``.
+
+    A capture cutoff is still a sound training basis — it is a conservative
+    bound, since we never claim to have known a forecast earlier than we
+    fetched it — but it is a *different* quantity from a run time, and the two
+    must not be mixed inside one lead bucket.  Training therefore selects a
+    single basis rather than trusting a flag.  There is deliberately no way to
+    assert a verified issue time without supplying one.
+    """
     city: str
     target_date: date
-    issued_at: datetime
     seen_at: datetime
     provider: str
     model: str
     members_c: Sequence[float]
     source_endpoint: str
-    issue_time_verified: bool
+    run_time: datetime | None = None
     quality_status: str = QUALITY_OK
     quality_detail: str | None = None
+
+    @property
+    def issue_time_verified(self) -> bool:
+        return self.run_time is not None
+
+    @property
+    def lead_basis(self) -> str:
+        return "run_time" if self.run_time is not None else "capture_cutoff"
+
+    @property
+    def issued_at(self) -> datetime:
+        """The information cutoff used for lead calculations."""
+        return self.run_time if self.run_time is not None else self.seen_at
 
 
 def record_forecast_snapshot(
@@ -475,16 +534,18 @@ def record_forecast_snapshot(
         """
         INSERT INTO forecast_snapshots (
             city, target_date, issued_at, first_seen_at, last_seen_at,
-            target_timezone, target_day_start_utc, lead_hours, lead_bucket,
+            capture_cutoff_at, lead_basis, target_timezone, target_day_start_utc,
+            lead_hours, lead_bucket,
             provider, model, content_version, member_count, member_values_json,
             mean_c, spread_c, std_c, q10_c, q25_c, q50_c, q75_c, q90_c,
             source_endpoint, issue_time_verified, quality_status, quality_detail,
             schema_version, canonical_hash
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             item.city, item.target_date.isoformat(), iso_utc(issued), iso_utc(seen),
-            iso_utc(seen), city.timezone, iso_utc(day_start), lead,
+            iso_utc(seen), iso_utc(seen), item.lead_basis, city.timezone,
+            iso_utc(day_start), lead,
             lead_bucket(lead), item.provider, item.model, content_version,
             len(values), canonical_json(values), values_mean,
             max(values) - min(values), values_std,
@@ -551,6 +612,8 @@ def aggregate_daily_observation(
     station_id: str,
     declared_precision: float | None = None,
     rounded_unit: str | None = None,
+    min_readings: int = 12,
+    min_span_hours: float = 18.0,
 ) -> int:
     city_cfg = config.CITIES.get(city)
     if city_cfg is None:
@@ -570,6 +633,13 @@ def aggregate_daily_observation(
     ]
     if not selected:
         raise ValueError("no quality station readings for local target day")
+    # A maximum computed from a fraction of the day understates the true daily
+    # max. Such rows are kept for audit but marked so they cannot become
+    # station truth: reconciliation and training both require 'ok'.
+    observed_times = [parse_utc(row["observed_at"]) for row in selected]
+    span_hours = (max(observed_times) - min(observed_times)).total_seconds() / 3600.0
+    sufficient = len(selected) >= min_readings and span_hours >= min_span_hours
+    quality = QUALITY_OK if sufficient else "partial_day"
     max_c = max(float(row["temperature_c"]) for row in selected)
     display = max_c if (rounded_unit or "C") == "C" else max_c * 9.0 / 5.0 + 32.0
     rounded = (
@@ -593,6 +663,7 @@ def aggregate_daily_observation(
         "source_ids": ids,
         "precision": declared_precision,
         "unit": rounded_unit,
+        "quality": quality,
     }
     digest = canonical_hash(payload)
     existing = conn.execute(
@@ -612,7 +683,7 @@ def aggregate_daily_observation(
         (
             city, target_date.isoformat(), city_cfg.timezone, provider, station_id,
             max_c, rounded, rounded_unit, declared_precision, canonical_json(ids),
-            "local-day-max-v1", revision, QUALITY_OK, iso_utc(), digest,
+            "local-day-max-v1", revision, quality, iso_utc(), digest,
             SCHEMA_VERSION,
         ),
     )
@@ -666,9 +737,15 @@ def training_forecast_rows(
     *,
     lead_bucket_name: str | None = None,
     cutoff: datetime | None = None,
+    lead_basis: str = "capture_cutoff",
 ) -> list[sqlite3.Row]:
+    if lead_basis not in {"run_time", "capture_cutoff"}:
+        raise ValueError(f"unsupported lead basis: {lead_basis}")
     clauses = [
-        "f.issue_time_verified=1",
+        # One basis per dataset. Run-time leads and capture-cutoff leads are
+        # different quantities; mixing them inside a lead bucket would make the
+        # bucket meaningless.
+        "f.lead_basis=?",
         "f.quality_status='ok'",
         "f.member_count>=2",
         "d.quality_status='ok'",
@@ -676,19 +753,31 @@ def training_forecast_rows(
         "f.first_seen_at < r.resolved_at",
         "f.issued_at < r.resolved_at",
     ]
-    params: list[Any] = []
+    params: list[Any] = [lead_basis]
     if lead_bucket_name:
         clauses.append("f.lead_bucket=?")
         params.append(lead_bucket_name)
     if cutoff:
         clauses.append("f.target_date<=?")
         params.append(cutoff.date().isoformat())
+    # Join to exactly one observation and one resolution per city/day. Multiple
+    # revisions or providers would otherwise multiply every forecast row and
+    # silently reweight the training set.
     query = f"""
         SELECT f.*, d.max_temperature_c, d.id AS daily_observation_id,
                r.id AS resolution_id, r.resolved_at
         FROM forecast_snapshots f
-        JOIN daily_observations d ON d.city=f.city AND d.target_date=f.target_date
-        JOIN market_resolutions r ON r.city=f.city AND r.target_date=f.target_date
+        JOIN daily_observations d ON d.id = (
+            SELECT d2.id FROM daily_observations d2
+            WHERE d2.city=f.city AND d2.target_date=f.target_date
+              AND d2.quality_status='ok' AND d2.reconciled=1
+            ORDER BY d2.revision DESC, d2.id DESC LIMIT 1
+        )
+        JOIN market_resolutions r ON r.id = (
+            SELECT r2.id FROM market_resolutions r2
+            WHERE r2.city=f.city AND r2.target_date=f.target_date
+            ORDER BY r2.resolved_at ASC, r2.id ASC LIMIT 1
+        )
         WHERE {' AND '.join(clauses)}
         ORDER BY f.target_date, f.city, f.issued_at
     """
@@ -751,15 +840,17 @@ def record_forecast_summary(
     cur = conn.execute(
         """
         INSERT INTO forecast_snapshots (
-            city,target_date,issued_at,first_seen_at,last_seen_at,target_timezone,
+            city,target_date,issued_at,first_seen_at,last_seen_at,capture_cutoff_at,
+            lead_basis,target_timezone,
             target_day_start_utc,lead_hours,lead_bucket,provider,model,content_version,
             member_count,member_values_json,mean_c,spread_c,std_c,q10_c,q25_c,q50_c,
             q75_c,q90_c,source_endpoint,issue_time_verified,quality_status,
             quality_detail,schema_version,canonical_hash
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             city, target_date.isoformat(), iso_utc(issued), iso_utc(seen), iso_utc(seen),
+            iso_utc(seen), "run_time",
             city_cfg.timezone, iso_utc(start), lead, lead_bucket(lead), provider, model,
             version, 1, canonical_json([float(value_c)]), float(value_c), 0.0, 0.0,
             float(value_c), float(value_c), float(value_c), float(value_c), float(value_c),
@@ -884,6 +975,9 @@ def record_market_resolution(
     source: Any,
 ) -> tuple[int, bool]:
     exact = exact_value_for_interval(winning_lower, winning_upper, declared_precision)
+    # Identity only. ``resolved_at`` is derived from Gamma's mutable updatedAt,
+    # so hashing it would mint a second row for the same outcome on every
+    # re-collection and double-count that market in every metric.
     payload = {
         "event_id": event_id,
         "condition_id": condition_id,
@@ -893,14 +987,37 @@ def record_market_resolution(
         "winning_lower": winning_lower,
         "winning_upper": winning_upper,
         "winning_unit": winning_unit,
-        "resolved_at": iso_utc(parse_utc(resolved_at)),
     }
     digest = canonical_hash(payload)
-    row = conn.execute(
-        "SELECT id FROM market_resolutions WHERE canonical_hash=?", (digest,)
+    resolved_iso = iso_utc(parse_utc(resolved_at))
+    existing = conn.execute(
+        "SELECT * FROM market_resolutions WHERE canonical_hash=?", (digest,)
     ).fetchone()
-    if row:
-        return int(row["id"]), False
+    if existing:
+        # The outcome is immutable; the declared metadata around it is not, so
+        # corrections are applied in place. The resolution time only ever moves
+        # earlier, since a later updatedAt must not loosen the look-ahead filter
+        # in training_forecast_rows.
+        precision = (
+            declared_precision if declared_precision is not None
+            else existing["declared_precision"]
+        )
+        station = declared_station or existing["declared_station"]
+        conn.execute(
+            """
+            UPDATE market_resolutions
+            SET declared_station=?, declared_precision=?, exact_rounded_value=?,
+                resolution_url=?, resolved_at=?, source_json=?
+            WHERE id=?
+            """,
+            (
+                station, precision,
+                exact_value_for_interval(winning_lower, winning_upper, precision),
+                resolution_url, min(str(existing["resolved_at"]), resolved_iso),
+                canonical_json(source), existing["id"],
+            ),
+        )
+        return int(existing["id"]), False
     cur = conn.execute(
         """
         INSERT INTO market_resolutions (
@@ -913,7 +1030,7 @@ def record_market_resolution(
         (
             event_id, condition_id, city, target_date.isoformat(), winning_label,
             winning_lower, winning_upper, winning_unit, exact, resolution_url,
-            declared_station, declared_precision, payload["resolved_at"],
+            declared_station, declared_precision, resolved_iso,
             iso_utc(parse_utc(collected_at)), "pending", canonical_json(source),
             digest, SCHEMA_VERSION,
         ),

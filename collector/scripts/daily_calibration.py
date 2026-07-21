@@ -41,6 +41,15 @@ async def run() -> None:
             "unresolved outcomes older than 3 days: "
             + ", ".join(status["unresolved_older_than_3d"])
         )
+    if status["reconciliation_discrepancies"]:
+        alerts.append(
+            f"{status['reconciliation_discrepancies']} resolutions disagree with station truth"
+        )
+    if status["missing_resolution_metadata"]:
+        alerts.append(
+            f"{status['missing_resolution_metadata']} resolutions lack a declared "
+            "station or rounding rule and can never reconcile"
+        )
     if alerts:
         async with httpx.AsyncClient(headers={"User-Agent": config.USER_AGENT}) as client:
             await send_message(client, "Wethr calibration alert: " + "; ".join(alerts))

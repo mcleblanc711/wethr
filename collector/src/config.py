@@ -22,6 +22,10 @@ DB_PATH = Path(os.getenv("WETHR_DB_PATH", str(DATA_DIR / "wethr.db"))).expanduse
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
+# How long a writer waits for the SQLite lock before giving up. The collector
+# loop and the calibration timers write to the same file.
+DB_BUSY_TIMEOUT_S = float(os.getenv("WETHR_DB_BUSY_TIMEOUT", "30"))
+
 # ---------------------------------------------------------------------------
 # Gamma API (Polymarket market discovery)
 # ---------------------------------------------------------------------------

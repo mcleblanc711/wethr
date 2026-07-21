@@ -46,6 +46,15 @@ from .calibration import (
 
 log = logging.getLogger(__name__)
 
+# BMA remains a shadow model: activating it needs per-model EMOS trained on
+# reconciled ledger samples, which the calibration pipeline does not yet
+# produce. This is the single switch that governs activation — the per-cohort
+# sample floor below is a necessary condition, not a sufficient one. Flipping
+# this to True without per-model EMOS would weight models by a CRPS computed
+# from quarantined legacy history.
+BMA_ACTIVATION_ENABLED = False
+BMA_MIN_SAMPLES_PER_MODEL = 120
+
 
 # ---------------------------------------------------------------------------
 # BMA weights
@@ -167,9 +176,23 @@ def compute_bma_weights(
     
     At temperature→∞, all models get equal weight (current behavior).
     """
+    n_models = len(config.ENSEMBLE_MODELS)
+    if not BMA_ACTIVATION_ENABLED:
+        # Short-circuit: without activation the result is discarded by the
+        # caller, so don't spend two table scans per city per scan computing it.
+        return BMAWeights(
+            weights={m: 1.0 / n_models for m in config.ENSEMBLE_MODELS},
+            city=city_slug,
+            temperature=temperature,
+            activation_ready=False,
+        )
+
     crps_scores = compute_model_crps(city_slug, db_path)
     sample_counts = compute_model_sample_counts(city_slug, db_path)
-    crps_scores = {m: score for m, score in crps_scores.items() if sample_counts.get(m, 0) >= 120}
+    crps_scores = {
+        m: score for m, score in crps_scores.items()
+        if sample_counts.get(m, 0) >= BMA_MIN_SAMPLES_PER_MODEL
+    }
 
     if not crps_scores:
         # No historical data — fall back to equal weights
@@ -212,7 +235,9 @@ def compute_bma_weights(
         crps_scores={m: round(v, 4) for m, v in crps_scores.items()},
         city=city_slug,
         n_samples=min((sample_counts.get(m, 0) for m in crps_scores), default=0),
-        activation_ready=False,  # Per-model EMOS is not yet trained; remain shadow
+        # Governed solely by BMA_ACTIVATION_ENABLED; reaching the sample floor
+        # is necessary but not sufficient.
+        activation_ready=BMA_ACTIVATION_ENABLED,
         temperature=temperature,
     )
 
