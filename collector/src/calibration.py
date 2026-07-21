@@ -237,55 +237,53 @@ def train_emos(
 def cross_validate_emos(
     data: TrainingData,
     city: str = "",
-    n_folds: int = 5,
+    n_folds: int = 4,
 ) -> tuple[EMOSParams, float]:
+    """Chronological expanding-window validation with a final time holdout.
+
+    ``TrainingData`` is expected in target-date order. No observation can be
+    trained after a later observation has entered a validation fold.
     """
-    K-fold cross-validation to estimate out-of-sample CRPS.
-    
-    Returns (best_params, cv_crps).
-    """
-    if data.n < n_folds * 5:
-        log.warning(f"Too few samples ({data.n}) for {n_folds}-fold CV")
+    if data.n < max(40, n_folds * 5):
+        log.warning(f"Too few samples ({data.n}) for chronological CV")
         params = train_emos(data, city)
         return params, params.crps_train
 
-    indices = np.arange(data.n)
-    np.random.shuffle(indices)
-    folds = np.array_split(indices, n_folds)
-    
+    holdout_size = 28 if data.n >= 56 else max(5, data.n // 5)
+    development = np.arange(data.n - holdout_size)
+    chunks = [chunk for chunk in np.array_split(development, n_folds + 1) if len(chunk)]
     cv_crps_values = []
-
-    for fold_idx in range(n_folds):
-        test_idx = folds[fold_idx]
-        train_idx = np.concatenate([folds[j] for j in range(n_folds) if j != fold_idx])
-
+    for fold_idx in range(1, min(len(chunks), n_folds + 1)):
+        train_idx = np.concatenate(chunks[:fold_idx])
+        test_idx = chunks[fold_idx]
         train_data = TrainingData(
             ens_means=data.ens_means[train_idx],
             ens_stds=data.ens_stds[train_idx],
             observations=data.observations[train_idx],
         )
-
         params = train_emos(train_data, city)
-
-        # Evaluate on test fold
-        test_crps = mean_crps(
+        cv_crps_values.append(mean_crps(
             (params.a, params.b, params.c, params.d),
-            data.ens_means[test_idx],
-            data.ens_stds[test_idx],
+            data.ens_means[test_idx], data.ens_stds[test_idx],
             data.observations[test_idx],
-        )
-        cv_crps_values.append(test_crps)
+        ))
 
-    cv_crps = float(np.mean(cv_crps_values))
-    cv_std = float(np.std(cv_crps_values))
-    log.info(
-        f"  CV CRPS for {city or 'global'}: {cv_crps:.4f} ± {cv_std:.4f}"
+    # The latest observations remain a final holdout. Fit the scoring model on
+    # development only, then fit deployable parameters on all available data.
+    holdout_idx = np.arange(data.n - holdout_size, data.n)
+    scoring_params = train_emos(TrainingData(
+        ens_means=data.ens_means[:data.n - holdout_size],
+        ens_stds=data.ens_stds[:data.n - holdout_size],
+        observations=data.observations[:data.n - holdout_size],
+    ), city)
+    holdout_crps = mean_crps(
+        (scoring_params.a, scoring_params.b, scoring_params.c, scoring_params.d),
+        data.ens_means[holdout_idx], data.ens_stds[holdout_idx],
+        data.observations[holdout_idx],
     )
-
-    # Train final model on all data
+    cv_crps = float(np.mean(cv_crps_values + [holdout_crps]))
     final_params = train_emos(data, city)
     final_params.crps_test = round(cv_crps, 4)
-
     return final_params, cv_crps
 
 

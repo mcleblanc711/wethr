@@ -39,6 +39,10 @@ from .paper_trader import (
 from .settlement import settle_date, settle_yesterday
 from .telegram import notify_trade_opened
 from .trading import TradingClient
+from .calibration_cli import add_calibration_commands, dispatch_calibration_command
+from .calibration_ops import (
+    persist_pipeline_forecasts, persist_market_quotes, unresolved_target_dates,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -88,6 +92,8 @@ async def scan(
     log.info(f"Fetching ensembles for: {', '.join(active_cities)}")
 
     forecasts = await fetch_all_ensembles(client, active_cities)
+    forecast_snapshot_ids = persist_pipeline_forecasts(forecasts)
+    await persist_market_quotes(client, markets, forecasts, forecast_snapshot_ids)
 
     # Step 3: Find edges
     edges = find_edges(markets, forecasts, min_edge=config.MIN_EDGE_THRESHOLD)
@@ -139,6 +145,8 @@ async def scan_and_trade(
 
     active_cities = list({m.city for m in markets})
     forecasts = await fetch_all_ensembles(client, active_cities)
+    forecast_snapshot_ids = persist_pipeline_forecasts(forecasts)
+    await persist_market_quotes(client, markets, forecasts, forecast_snapshot_ids)
 
     # Detect forecast shifts (latency exploitation)
     if latency_detector:
@@ -247,7 +255,10 @@ def _load_bma_weights_safe() -> dict:
     """Load BMA weights, returning empty dict on any failure."""
     try:
         from .bma import load_all_bma_weights
-        return load_all_bma_weights()
+        return {
+            city: weights for city, weights in load_all_bma_weights().items()
+            if weights.n_samples >= 120 and weights.activation_ready
+        }
     except Exception:
         return {}
 
@@ -323,14 +334,12 @@ async def run_loop(
         while True:
             today = datetime.now(timezone.utc).date()
 
-            # Auto-settle: try last 3 days of unsettled trades (once per day).
-            # Gamma API resolves markets same-day or next-day, so we check
-            # yesterday through 3 days ago. If Gamma hasn't resolved yet,
-            # the fallback NWS/Open-Meteo path handles it.
+            # Retry every unresolved target date daily, regardless of age.
             if last_settle_date != today:
-                for days_back in range(1, 4):
+                targets = set(unresolved_target_dates())
+                targets.add(today - timedelta(days=1))
+                for settle_target in sorted(targets):
                     try:
-                        settle_target = today - timedelta(days=days_back)
                         result = await settle_date(
                             client, settle_target, trading_client=trading_client,
                         )
@@ -432,6 +441,8 @@ def main():
     # doctor
     sub.add_parser("doctor", help="Show local database/export wiring status")
 
+    add_calibration_commands(sub)
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -439,6 +450,9 @@ def main():
 
     # Init database
     init_db()
+
+    if dispatch_calibration_command(args):
+        return
 
     if args.command == "scan":
         async def _run():

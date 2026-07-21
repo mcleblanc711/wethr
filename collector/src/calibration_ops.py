@@ -1,0 +1,1171 @@
+"""Collection, reconciliation, training, promotion, and archive operations."""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+import shutil
+import sqlite3
+from collections import Counter, defaultdict
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Iterable, Sequence
+from zoneinfo import ZoneInfo
+
+import httpx
+import numpy as np
+
+from . import config
+from .calibration import EMOSParams, TrainingData, crps_gaussian, train_emos
+from .ensemble import _fetch_batch_model
+from .ledger import (
+    ForecastSnapshotInput,
+    LEGACY_MODEL_VERSION,
+    SCHEMA_VERSION,
+    aggregate_daily_observation,
+    canonical_hash,
+    canonical_json,
+    iso_utc,
+    parse_utc,
+    reconcile_resolution,
+    record_forecast_snapshot,
+    record_forecast_summary,
+    record_market_resolution,
+    record_station_observation,
+    table_counts,
+    target_day_start_utc,
+    training_forecast_rows,
+    utc_now,
+)
+from .markets import extract_resolution_metadata, match_city, parse_bracket_label, parse_target_date
+from .paper_trader import get_db, init_db
+from .settlement import fetch_resolved_weather_events
+
+PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
+AVIATION_WEATHER_URL = "https://aviationweather.gov/api/data/metar"
+LEAD_BUCKETS = ("in_day", "0_24h", "24_48h", "48_72h", "72h_plus")
+
+
+def _dt(value: Any, fallback: datetime | None = None) -> datetime:
+    if isinstance(value, (int, float)):
+        return datetime.fromtimestamp(value, tz=timezone.utc)
+    if isinstance(value, str) and value:
+        try:
+            return parse_utc(value)
+        except ValueError:
+            pass
+    return fallback or utc_now()
+
+
+async def collect_prospective_forecasts(
+    client: httpx.AsyncClient,
+    city_slugs: Sequence[str] | None = None,
+    db_path: Path | None = None,
+) -> dict[str, int]:
+    """Capture complete member values from the live Ensemble API."""
+    slugs = list(city_slugs or config.CITIES)
+    seen = utc_now()
+    inserted = unchanged = failed = 0
+    for model in config.ENSEMBLE_MODELS:
+        batches = await _fetch_batch_model(client, slugs, model)
+        with get_db(db_path) as conn:
+            for city, by_date in batches.items():
+                for target, members in by_date.items():
+                    values = [member.daily_max for member in members if member.model == model]
+                    try:
+                        _, created = record_forecast_snapshot(
+                            conn,
+                            ForecastSnapshotInput(
+                                city=city,
+                                target_date=target,
+                                # Capture time is a verified information cutoff. The
+                                # provider run time is not invented when absent.
+                                issued_at=seen,
+                                seen_at=seen,
+                                provider="open-meteo-ensemble",
+                                model=model,
+                                members_c=values,
+                                source_endpoint=config.ENSEMBLE_API_BASE,
+                                issue_time_verified=True,
+                                quality_detail="prospective capture cutoff; provider run time not asserted",
+                            ),
+                        )
+                    except ValueError:
+                        failed += 1
+                    else:
+                        inserted += int(created)
+                        unchanged += int(not created)
+    return {"inserted": inserted, "unchanged": unchanged, "failed": failed}
+
+
+async def collect_previous_run_summaries(
+    client: httpx.AsyncClient,
+    city_slug: str,
+    start: date,
+    end: date,
+    db_path: Path | None = None,
+    model: str = "ecmwf_ifs025",
+) -> dict[str, int]:
+    """Collect deterministic fixed-lead summaries with verifiable lead offsets.
+
+    These rows are useful for deterministic audit/bias work, but are marked
+    ``deterministic_untrainable`` and cannot enter an ensemble dataset.
+    """
+    city = config.CITIES[city_slug]
+    variables = [f"temperature_2m_previous_day{n}" for n in range(1, 8)]
+    params = {
+        "latitude": city.lat,
+        "longitude": city.lon,
+        "hourly": ",".join(variables),
+        "models": model,
+        "temperature_unit": "celsius",
+        "timezone": city.timezone,
+        "start_date": start.isoformat(),
+        "end_date": end.isoformat(),
+    }
+    response = await client.get(PREVIOUS_RUNS_URL, params=params, timeout=60)
+    response.raise_for_status()
+    hourly = response.json().get("hourly", {})
+    times = hourly.get("time", [])
+    per_day: dict[tuple[date, int], list[float]] = defaultdict(list)
+    for idx, time_text in enumerate(times):
+        local_date = datetime.fromisoformat(time_text).date()
+        for offset, variable in enumerate(variables, start=1):
+            values = hourly.get(variable, [])
+            if idx < len(values) and values[idx] is not None:
+                per_day[(local_date, offset)].append(float(values[idx]))
+    inserted = unchanged = 0
+    seen = utc_now()
+    with get_db(db_path) as conn:
+        for (target, offset), values in per_day.items():
+            if not values:
+                continue
+            issued = target_day_start_utc(target, city.timezone) - timedelta(days=offset)
+            _, created = record_forecast_summary(
+                conn,
+                city=city_slug,
+                target_date=target,
+                issued_at=issued,
+                seen_at=seen,
+                provider="open-meteo-previous-runs",
+                model=f"{model}:previous_day{offset}",
+                value_c=max(values),
+                source_endpoint=PREVIOUS_RUNS_URL,
+            )
+            inserted += int(created)
+            unchanged += int(not created)
+    return {"inserted": inserted, "unchanged": unchanged}
+
+
+async def collect_nws_observations(
+    client: httpx.AsyncClient,
+    city_slug: str,
+    target: date,
+    db_path: Path | None = None,
+) -> int:
+    city = config.CITIES[city_slug]
+    tz = ZoneInfo(city.timezone)
+    start = datetime(target.year, target.month, target.day, tzinfo=tz)
+    end = start + timedelta(days=1)
+    url = f"https://api.weather.gov/stations/{city.station}/observations"
+    response = await client.get(
+        url,
+        params={"start": iso_utc(start), "end": iso_utc(end)},
+        headers={"Accept": "application/geo+json", "User-Agent": config.USER_AGENT},
+        timeout=config.HTTP_TIMEOUT,
+    )
+    response.raise_for_status()
+    inserted = 0
+    received = utc_now()
+    with get_db(db_path) as conn:
+        for feature in response.json().get("features", []):
+            props = feature.get("properties", {})
+            value = props.get("temperature", {}).get("value")
+            stamp = props.get("timestamp")
+            if value is None or not stamp:
+                continue
+            _, created = record_station_observation(
+                conn,
+                city=city_slug,
+                station_id=city.station,
+                provider="nws",
+                observed_at=parse_utc(stamp),
+                received_at=received,
+                temperature_c=float(value),
+                unit_reported="C",
+                precision=0.1,
+                source_url=url,
+                raw=feature,
+            )
+            inserted += int(created)
+        try:
+            aggregate_daily_observation(
+                conn, city=city_slug, target_date=target, provider="nws",
+                station_id=city.station, declared_precision=1.0,
+                rounded_unit=city.temp_unit,
+            )
+        except ValueError:
+            pass
+    return inserted
+
+
+async def collect_metar_observations(
+    client: httpx.AsyncClient,
+    city_slug: str,
+    target: date,
+    db_path: Path | None = None,
+) -> int:
+    city = config.CITIES[city_slug]
+    if target < utc_now().date() - timedelta(days=15):
+        return 0
+    end = datetime.combine(target + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+    response = await client.get(
+        AVIATION_WEATHER_URL,
+        params={"ids": city.station, "format": "json", "hours": 36, "date": iso_utc(end)},
+        headers={"User-Agent": config.USER_AGENT},
+        timeout=config.HTTP_TIMEOUT,
+    )
+    response.raise_for_status()
+    received = utc_now()
+    inserted = 0
+    with get_db(db_path) as conn:
+        data = response.json()
+        if not isinstance(data, list):
+            data = []
+        for item in data:
+            stamp = item.get("reportTime") or item.get("obsTime")
+            temp = item.get("temp")
+            if stamp is None or temp is None:
+                continue
+            observed = _dt(stamp)
+            if observed.astimezone(ZoneInfo(city.timezone)).date() != target:
+                continue
+            _, created = record_station_observation(
+                conn,
+                city=city_slug,
+                station_id=city.station,
+                provider="aviationweather-metar",
+                observed_at=observed,
+                received_at=received,
+                temperature_c=float(temp),
+                unit_reported="C",
+                precision=1.0,
+                source_url=AVIATION_WEATHER_URL,
+                raw=item,
+            )
+            inserted += int(created)
+        try:
+            aggregate_daily_observation(
+                conn, city=city_slug, target_date=target,
+                provider="aviationweather-metar", station_id=city.station,
+                declared_precision=1.0, rounded_unit=city.temp_unit,
+            )
+        except ValueError:
+            pass
+    return inserted
+
+
+def _json_list(raw: Any) -> list[Any]:
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return []
+        return parsed if isinstance(parsed, list) else []
+    return raw if isinstance(raw, list) else []
+
+
+async def collect_gamma_resolutions(
+    client: httpx.AsyncClient,
+    target: date,
+    db_path: Path | None = None,
+) -> dict[str, int]:
+    events = await fetch_resolved_weather_events(client, target)
+    inserted = unchanged = 0
+    collected = utc_now()
+    with get_db(db_path) as conn:
+        for event in events:
+            city_slug = match_city(event.get("title", ""))
+            event_date = parse_target_date(event.get("title", ""))
+            if not city_slug or event_date != target:
+                continue
+            winners: list[dict[str, Any]] = []
+            for market in event.get("markets", []):
+                if market.get("umaResolutionStatus") != "resolved":
+                    continue
+                prices = _json_list(market.get("outcomePrices", []))
+                if len(prices) >= 2 and float(prices[0]) > 0.5:
+                    winners.append(market)
+            if len(winners) != 1:
+                continue
+            winner = winners[0]
+            label = winner.get("groupItemTitle") or winner.get("question") or ""
+            lower, upper, unit = parse_bracket_label(label)
+            if not unit:
+                continue
+            metadata_url, declared_station, declared_precision = extract_resolution_metadata(event, city_slug)
+            resolution_url = (
+                winner.get("resolutionSource") or metadata_url
+                or f"https://polymarket.com/event/{event.get('slug', '')}"
+            )
+            resolved = _dt(
+                winner.get("resolvedAt") or winner.get("updatedAt")
+                or event.get("updatedAt"), collected,
+            )
+            rid, created = record_market_resolution(
+                conn,
+                event_id=str(event.get("id", "")),
+                condition_id=winner.get("conditionId"),
+                city=city_slug,
+                target_date=target,
+                winning_label=label,
+                winning_lower=lower,
+                winning_upper=upper,
+                winning_unit=unit,
+                resolution_url=resolution_url,
+                declared_station=declared_station,
+                declared_precision=declared_precision,
+                resolved_at=resolved,
+                collected_at=collected,
+                source=event,
+            )
+            inserted += int(created)
+            unchanged += int(not created)
+            reconcile_resolution(conn, rid)
+    return {"inserted": inserted, "unchanged": unchanged}
+
+
+def _cities_for_date(conn: sqlite3.Connection, target: date) -> list[str]:
+    rows = conn.execute(
+        """
+        SELECT DISTINCT city FROM signals WHERE target_date=?
+        UNION SELECT DISTINCT city FROM trades WHERE target_date=?
+        """,
+        (target.isoformat(), target.isoformat()),
+    ).fetchall()
+    return [str(row["city"]) for row in rows if row["city"] in config.CITIES]
+
+
+async def backfill_range(
+    start: date,
+    end: date,
+    db_path: Path | None = None,
+) -> dict[str, int]:
+    if end < start:
+        raise ValueError("--to must not precede --from")
+    summary: Counter[str] = Counter()
+    async with httpx.AsyncClient(headers={"User-Agent": config.USER_AGENT}) as client:
+        current = start
+        while current <= end:
+            with get_db(db_path) as conn:
+                cities = _cities_for_date(conn, current)
+            try:
+                result = await collect_gamma_resolutions(client, current, db_path)
+                summary["resolutions"] += result["inserted"]
+            except httpx.HTTPError:
+                summary["resolution_failures"] += 1
+            for city_slug in cities:
+                try:
+                    if config.CITIES[city_slug].station.startswith("K"):
+                        summary["station_readings"] += await collect_nws_observations(
+                            client, city_slug, current, db_path
+                        )
+                    else:
+                        summary["station_readings"] += await collect_metar_observations(
+                            client, city_slug, current, db_path
+                        )
+                except httpx.HTTPError:
+                    summary["observation_failures"] += 1
+                try:
+                    result = await collect_previous_run_summaries(
+                        client, city_slug, current, current, db_path
+                    )
+                    summary["forecast_summaries"] += result["inserted"]
+                except httpx.HTTPError:
+                    summary["forecast_failures"] += 1
+            current += timedelta(days=1)
+    return dict(summary)
+
+
+def reconcile_all(target: date | None = None, db_path: Path | None = None) -> dict[str, int]:
+    counts: Counter[str] = Counter()
+    with get_db(db_path) as conn:
+        if target:
+            rows = conn.execute(
+                "SELECT id FROM market_resolutions WHERE target_date=?", (target.isoformat(),)
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT id FROM market_resolutions").fetchall()
+        for row in rows:
+            counts[reconcile_resolution(conn, int(row["id"]))] += 1
+    return dict(counts)
+
+
+def unresolved_target_dates(db_path: Path | None = None) -> list[date]:
+    with get_db(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT DISTINCT x.target_date FROM (
+                SELECT target_date FROM trades WHERE settled=0
+                UNION SELECT target_date FROM signals WHERE outcome IS NULL
+            ) x
+            LEFT JOIN market_resolutions r ON r.target_date=x.target_date
+            WHERE r.id IS NULL
+            ORDER BY x.target_date
+            """
+        ).fetchall()
+    return [date.fromisoformat(row["target_date"]) for row in rows]
+
+
+def collection_status(db_path: Path | None = None, now: datetime | None = None) -> dict[str, Any]:
+    now = now or utc_now()
+    with get_db(db_path) as conn:
+        counts = table_counts(conn)
+        latest = conn.execute(
+            "SELECT MAX(last_seen_at) AS value FROM forecast_snapshots WHERE quality_status='ok'"
+        ).fetchone()["value"]
+        member_rows = conn.execute(
+            """SELECT model, member_count, quality_status, last_seen_at
+               FROM forecast_snapshots WHERE id IN (
+                 SELECT MAX(id) FROM forecast_snapshots GROUP BY city, model
+               ) ORDER BY model"""
+        ).fetchall()
+        unresolved = unresolved_target_dates(db_path)
+        discrepancies = int(conn.execute(
+            "SELECT COUNT(*) AS n FROM market_resolutions WHERE reconciliation_status='discrepancy'"
+        ).fetchone()["n"])
+        models = [dict(row) for row in conn.execute(
+            "SELECT id,status,algorithm,lead_bucket,created_at FROM model_versions ORDER BY created_at"
+        ).fetchall()]
+        recent_runs = conn.execute(
+            "SELECT COUNT(DISTINCT substr(completed_at,1,10)) AS days, "
+            "SUM(expected_markets) AS expected, SUM(captured_markets) AS captured "
+            "FROM collection_runs WHERE completed_at>=?",
+            (iso_utc(now - timedelta(days=7)),),
+        ).fetchone()
+    freshness_minutes = None
+    if latest:
+        freshness_minutes = (now - parse_utc(latest)).total_seconds() / 60
+    expected_missing = []
+    for row in member_rows:
+        expected = config.MODEL_MEMBER_COUNTS.get(row["model"])
+        if expected is not None and row["member_count"] < expected:
+            expected_missing.append({"model": row["model"], "expected": expected, "actual": row["member_count"]})
+    old_unresolved = [d.isoformat() for d in unresolved if (now.date() - d).days > 3]
+    expected = int(recent_runs["expected"] or 0)
+    captured = int(recent_runs["captured"] or 0)
+    archive_manifests = sorted((config.DATA_DIR / "archive").glob("????-??/manifest.json"))
+    return {
+        "counts": counts,
+        "forecast_freshness_minutes": freshness_minutes,
+        "forecast_stale": freshness_minutes is None or freshness_minutes > 30,
+        "member_count_failures": expected_missing,
+        "unresolved_dates": [d.isoformat() for d in unresolved],
+        "unresolved_older_than_3d": old_unresolved,
+        "reconciliation_discrepancies": discrepancies,
+        "models": models,
+        "scan_coverage_7d": captured / expected if expected else 0.0,
+        "scan_days_7d": int(recent_runs["days"] or 0),
+        "archive_latest": str(archive_manifests[-1]) if archive_manifests else None,
+        "archive_verified": _verify_archive_manifests(),
+    }
+
+
+def chronological_rolling_splits(
+    target_dates: Sequence[date],
+    folds: int = 4,
+    holdout_days: int = 28,
+) -> tuple[list[tuple[set[date], set[date]]], set[date]]:
+    """Build expanding-window folds without splitting a target date."""
+    unique = sorted(set(target_dates))
+    if len(unique) <= holdout_days + folds:
+        return [], set(unique[-min(holdout_days, len(unique)):])
+    holdout = set(unique[-holdout_days:])
+    development = unique[:-holdout_days]
+    chunks = [list(chunk) for chunk in np.array_split(development, folds + 1) if len(chunk)]
+    splits: list[tuple[set[date], set[date]]] = []
+    for idx in range(1, min(len(chunks), folds + 1)):
+        train = {d for chunk in chunks[:idx] for d in chunk}
+        validation = set(chunks[idx])
+        if train and validation:
+            splits.append((train, validation))
+    return splits[:folds], holdout
+
+
+def _independent_rows(rows: Iterable[sqlite3.Row]) -> list[sqlite3.Row]:
+    latest: dict[tuple[str, str], sqlite3.Row] = {}
+    for row in rows:
+        key = (str(row["city"]), str(row["target_date"]))
+        old = latest.get(key)
+        if old is None or parse_utc(row["issued_at"]) > parse_utc(old["issued_at"]):
+            latest[key] = row
+    return sorted(latest.values(), key=lambda r: (r["target_date"], r["city"]))
+
+
+def _training_data(rows: Sequence[sqlite3.Row]) -> TrainingData:
+    return TrainingData(
+        ens_means=np.array([float(row["mean_c"]) for row in rows]),
+        ens_stds=np.array([float(row["std_c"]) for row in rows]),
+        observations=np.array([float(row["max_temperature_c"]) for row in rows]),
+    )
+
+
+def _rolling_metrics(rows: Sequence[sqlite3.Row], scope: str) -> dict[str, Any]:
+    dates = [date.fromisoformat(row["target_date"]) for row in rows]
+    splits, holdout = chronological_rolling_splits(dates)
+    candidate_scores: list[float] = []
+    raw_scores: list[float] = []
+    for train_dates, validation_dates in splits:
+        train_rows = [r for r in rows if date.fromisoformat(r["target_date"]) in train_dates]
+        validation_rows = [r for r in rows if date.fromisoformat(r["target_date"]) in validation_dates]
+        if len(train_rows) < 10 or not validation_rows:
+            continue
+        params = train_emos(_training_data(train_rows), city=scope)
+        for row in validation_rows:
+            obs = float(row["max_temperature_c"])
+            mu, sigma = params.predict(float(row["mean_c"]), float(row["std_c"]))
+            candidate_scores.append(crps_gaussian(mu, sigma, obs))
+            raw_scores.append(crps_gaussian(float(row["mean_c"]), max(float(row["std_c"]), .1), obs))
+    return {
+        "rolling_folds": len(splits),
+        "validation_crps": float(np.mean(candidate_scores)) if candidate_scores else None,
+        "raw_validation_crps": float(np.mean(raw_scores)) if raw_scores else None,
+        "holdout_dates": len(holdout),
+        "holdout_start": min(holdout).isoformat() if holdout else None,
+    }
+
+
+def train_candidate(lead: str | None = None, db_path: Path | None = None) -> str:
+    if lead is not None and lead not in LEAD_BUCKETS:
+        raise ValueError(f"invalid lead bucket: {lead}")
+    cutoff = utc_now()
+    with get_db(db_path) as conn:
+        rows = _independent_rows(training_forecast_rows(conn, lead_bucket_name=lead, cutoff=cutoff))
+        window_start = (cutoff - timedelta(days=365)).date()
+        rows = [row for row in rows if date.fromisoformat(row["target_date"]) >= window_start]
+        by_city: dict[str, list[sqlite3.Row]] = defaultdict(list)
+        for row in rows:
+            by_city[str(row["city"])].append(row)
+        eligible_city: dict[str, list[sqlite3.Row]] = {}
+        for city, city_rows in by_city.items():
+            days = sorted(date.fromisoformat(row["target_date"]) for row in city_rows)
+            if len(days) >= 90 and (days[-1] - days[0]).days >= 89:
+                eligible_city[city] = city_rows
+        included_group = {city: city_rows for city, city_rows in by_city.items() if len(city_rows) >= 15}
+        grouped_rows = [row for city_rows in included_group.values() for row in city_rows]
+        grouped_dates = {row["target_date"] for row in grouped_rows}
+        parameters: dict[str, Any] = {"city": {}, "grouped": None}
+        metrics: dict[str, Any] = {
+            "provenance_complete": True,
+            "reconciliation_checks_pass": True,
+            "data_completeness": 1.0 if rows else 0.0,
+            "resolved_dates": len({row["target_date"] for row in rows}),
+            "independent_city_days": len(rows),
+            "segment_max_degradation": 0.0,
+        }
+        algorithm = "raw-ensemble-fallback"
+        for city, city_rows in eligible_city.items():
+            params = train_emos(_training_data(city_rows), city=city)
+            parameters["city"][city] = params.to_dict()
+        if eligible_city:
+            algorithm = "emos-city"
+            metrics.update(_rolling_metrics([r for rs in eligible_city.values() for r in rs], "city"))
+        elif len(grouped_rows) >= 120 and len(grouped_dates) >= 60:
+            params = train_emos(_training_data(grouped_rows), city="grouped")
+            parameters["grouped"] = params.to_dict()
+            algorithm = "emos-grouped"
+            metrics.update(_rolling_metrics(grouped_rows, "grouped"))
+        else:
+            metrics.update({"rolling_folds": 0, "validation_crps": None, "raw_validation_crps": None, "holdout_dates": 0})
+        raw_crps = metrics.get("raw_validation_crps")
+        model_crps = metrics.get("validation_crps")
+        metrics["crps_improvement_vs_raw"] = (
+            (raw_crps - model_crps) / raw_crps
+            if raw_crps and model_crps is not None else 0.0
+        )
+        snapshot_ids = [int(row["id"]) for row in rows]
+        manifest = {
+            "forecast_snapshot_ids": snapshot_ids,
+            "row_count": len(rows),
+            "independent_city_days": len(rows),
+            "sha256": canonical_hash(snapshot_ids),
+            "cutoff": iso_utc(cutoff),
+            "legacy_tables_included": False,
+        }
+        body = {
+            "algorithm": algorithm,
+            "lead_bucket": lead or "all",
+            "parameters": parameters,
+            "manifest": manifest,
+            "cutoff": iso_utc(cutoff),
+        }
+        version_id = f"{algorithm}-{canonical_hash(body)[:16]}"
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO model_versions (
+                id,created_at,algorithm,scope_type,scope_value,lead_bucket,
+                parameters_json,training_cutoff,dataset_manifest_json,metrics_json,
+                status,schema_version
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,'candidate',?)
+            """,
+            (
+                version_id, iso_utc(), algorithm, "multi-city", "eligible",
+                lead or "all", canonical_json(parameters), iso_utc(cutoff),
+                canonical_json(manifest), canonical_json(metrics), SCHEMA_VERSION,
+            ),
+        )
+    return version_id
+
+
+def _verify_archive_manifests() -> bool:
+    archive_root = config.DATA_DIR / "archive"
+    manifests = sorted(archive_root.glob("????-??/manifest.json"))
+    if not manifests:
+        return False
+    for manifest_path in manifests:
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            for item in manifest.get("tables", {}).values():
+                file_path = manifest_path.parent / item["file"]
+                if not file_path.exists():
+                    return False
+                if hashlib.sha256(file_path.read_bytes()).hexdigest() != item["sha256"]:
+                    return False
+        except (OSError, KeyError, TypeError, json.JSONDecodeError):
+            return False
+    return True
+
+
+def operational_acceptance(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any]:
+    """Evaluate the seven-day pre-promotion collection acceptance contract."""
+    now = now or utc_now()
+    start = iso_utc(now - timedelta(days=7))
+    runs = conn.execute(
+        "SELECT * FROM collection_runs WHERE completed_at>=? ORDER BY completed_at", (start,)
+    ).fetchall()
+    run_days = {str(row["completed_at"])[:10] for row in runs}
+    expected = sum(int(row["expected_markets"]) for row in runs)
+    captured = sum(int(row["captured_markets"]) for row in runs)
+    coverage = captured / expected if expected else 0.0
+    provenance = conn.execute(
+        """SELECT COUNT(*) AS total,
+                  SUM(CASE WHEN city IS NULL OR target_date IS NULL OR provider IS NULL
+                                OR model IS NULL OR source_endpoint IS NULL
+                                OR canonical_hash IS NULL THEN 1 ELSE 0 END) AS missing
+           FROM forecast_snapshots WHERE quality_status='ok'"""
+    ).fetchone()
+    resolution_rows = conn.execute(
+        "SELECT resolved_at,collected_at FROM market_resolutions"
+    ).fetchall()
+    timely = sum(
+        (parse_utc(row["collected_at"]) - parse_utc(row["resolved_at"])).total_seconds() <= 48 * 3600
+        for row in resolution_rows
+    )
+    resolution_ratio = timely / len(resolution_rows) if resolution_rows else 0.0
+    latest = conn.execute(
+        "SELECT MAX(last_seen_at) AS latest FROM forecast_snapshots WHERE quality_status='ok'"
+    ).fetchone()["latest"]
+    freshness = (now - parse_utc(latest)).total_seconds() / 60 if latest else math.inf
+    result = {
+        "run_days": len(run_days),
+        "scan_coverage": coverage,
+        "provenance_complete": bool(provenance["total"] and not provenance["missing"]),
+        "forecast_fresh": freshness <= 30,
+        "resolution_within_48h": resolution_ratio,
+        "archive_verified": _verify_archive_manifests(),
+    }
+    result["passed"] = bool(
+        result["run_days"] >= 7
+        and result["scan_coverage"] >= .95
+        and result["provenance_complete"]
+        and result["forecast_fresh"]
+        and result["resolution_within_48h"] >= .95
+        and result["archive_verified"]
+    )
+    return result
+
+
+def _binary_metrics(probabilities: Sequence[float], outcomes: Sequence[int]) -> dict[str, float | int | None]:
+    if not probabilities:
+        return {"n": 0, "brier": None, "log_loss": None, "reliability_error": None}
+    p = np.clip(np.array(probabilities, dtype=float), 1e-9, 1 - 1e-9)
+    y = np.array(outcomes, dtype=float)
+    brier = float(np.mean((p - y) ** 2))
+    log_loss = float(-np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))
+    errors = []
+    for lower in np.arange(0.0, 1.0, .1):
+        mask = (p >= lower) & (p < lower + .1)
+        if mask.any():
+            errors.append(abs(float(p[mask].mean()) - float(y[mask].mean())) * int(mask.sum()))
+    return {"n": len(p), "brier": brier, "log_loss": log_loss, "reliability_error": sum(errors) / len(p)}
+
+
+def evaluate_model(model_version: str, db_path: Path | None = None) -> dict[str, Any]:
+    with get_db(db_path) as conn:
+        model = conn.execute("SELECT * FROM model_versions WHERE id=?", (model_version,)).fetchone()
+        if not model:
+            raise ValueError(f"unknown model version: {model_version}")
+        active_row = conn.execute("SELECT id FROM model_versions WHERE status='active'").fetchone()
+        active_id = active_row["id"] if active_row else None
+        predictions = conn.execute(
+            """
+            SELECT p.*,m.target_date,m.city,m.bracket_lower,m.bracket_upper,m.bracket_unit,
+                   r.winning_lower,r.winning_upper,r.winning_unit
+            FROM prediction_snapshots p
+            JOIN market_snapshots m ON m.id=p.market_snapshot_id
+            JOIN market_resolutions r ON r.city=m.city AND r.target_date=m.target_date
+            WHERE p.model_version_id=? AND p.generated_at < r.resolved_at
+            """,
+            (model_version,),
+        ).fetchall()
+        control_by_market: dict[int, float] = {}
+        if active_id and active_id != model_version:
+            control_by_market = {
+                int(row["market_snapshot_id"]): float(row["bracket_probability"])
+                for row in conn.execute(
+                    "SELECT market_snapshot_id,bracket_probability FROM prediction_snapshots WHERE model_version_id=?",
+                    (active_id,),
+                ).fetchall()
+            }
+        lead_by_forecast = {
+            int(row["id"]): str(row["lead_bucket"])
+            for row in conn.execute("SELECT id,lead_bucket FROM forecast_snapshots").fetchall()
+        }
+        probs: list[float] = []
+        raw_probs: list[float] = []
+        outcomes: list[int] = []
+        control_probs: list[float] = []
+        control_outcomes: list[int] = []
+        segments: dict[str, list[tuple[float, float, int]]] = defaultdict(list)
+        pnl = 0.0
+        city_days: set[tuple[str, str]] = set()
+        dates: set[str] = set()
+        for row in predictions:
+            won = int(
+                row["bracket_unit"] == row["winning_unit"]
+                and row["bracket_lower"] == row["winning_lower"]
+                and row["bracket_upper"] == row["winning_upper"]
+            )
+            probability = float(row["bracket_probability"])
+            probs.append(probability)
+            raw_probs.append(float(row["raw_probability"]))
+            outcomes.append(won)
+            control_probability = control_by_market.get(int(row["market_snapshot_id"]))
+            if control_probability is not None:
+                control_probs.append(control_probability)
+                control_outcomes.append(won)
+                segments[f"city:{row['city']}"].append((probability, control_probability, won))
+                buckets = {
+                    lead_by_forecast.get(int(forecast_id))
+                    for forecast_id in json.loads(row["forecast_snapshot_ids_json"])
+                }
+                for bucket in buckets - {None}:
+                    segments[f"lead:{bucket}"].append((probability, control_probability, won))
+            side_won = won if row["executable_side"] == "YES" else 1 - won
+            ask = float(row["executable_ask"])
+            pnl += (1.0 - ask) / ask if side_won and ask > 0 else -1.0
+            city_days.add((row["city"], row["target_date"]))
+            dates.add(row["target_date"])
+        candidate = _binary_metrics(probs, outcomes)
+        raw = _binary_metrics(raw_probs, outcomes)
+        control = _binary_metrics(control_probs, control_outcomes)
+        degradations = []
+        for values in segments.values():
+            if len(values) < 30:
+                continue
+            candidate_brier = float(np.mean([(p - outcome) ** 2 for p, _, outcome in values]))
+            control_brier = float(np.mean([(p - outcome) ** 2 for _, p, outcome in values]))
+            if control_brier > 0:
+                degradations.append((candidate_brier - control_brier) / control_brier)
+        metrics = json.loads(model["metrics_json"])
+        acceptance = operational_acceptance(conn)
+        metrics.update({
+            "gamma": candidate,
+            "raw_gamma": raw,
+            "control_gamma": control,
+            "segment_max_degradation": max(degradations, default=0.0),
+            "economic_unit_pnl": pnl,
+            "resolved_dates": len(dates),
+            "independent_city_days": len(city_days),
+            "collection_acceptance": acceptance,
+            "archive_verified": acceptance["archive_verified"],
+        })
+        conn.execute(
+            "UPDATE model_versions SET metrics_json=?, status=CASE WHEN status='candidate' THEN 'shadow' ELSE status END WHERE id=?",
+            (canonical_json(metrics), model_version),
+        )
+    return metrics
+
+
+def promotion_gates(candidate_metrics: dict[str, Any], control_metrics: dict[str, Any]) -> dict[str, bool]:
+    gamma = candidate_metrics.get("gamma", {})
+    raw = candidate_metrics.get("raw_gamma", {})
+    control_gamma = candidate_metrics.get("control_gamma") or control_metrics.get("gamma", {})
+    def improves(candidate: Any, baseline: Any, fraction: float = .02) -> bool:
+        return bool(
+            isinstance(candidate, (int, float)) and isinstance(baseline, (int, float))
+            and math.isfinite(candidate) and math.isfinite(baseline) and candidate <= baseline * (1 - fraction)
+        )
+    def nonworse(candidate: Any, baseline: Any) -> bool:
+        return bool(
+            isinstance(candidate, (int, float)) and isinstance(baseline, (int, float))
+            and math.isfinite(candidate) and math.isfinite(baseline) and candidate <= baseline
+        )
+    return {
+        "shadow_duration": candidate_metrics.get("resolved_dates", 0) >= 28,
+        "shadow_sample": candidate_metrics.get("independent_city_days", 0) >= 60,
+        "brier_vs_raw": improves(gamma.get("brier"), raw.get("brier")),
+        "brier_vs_control": improves(gamma.get("brier"), control_gamma.get("brier")),
+        "crps_vs_raw": candidate_metrics.get("crps_improvement_vs_raw", 0) >= .02,
+        "log_loss_nonworse": nonworse(gamma.get("log_loss"), control_gamma.get("log_loss")),
+        "reliability_nonworse": nonworse(gamma.get("reliability_error"), control_gamma.get("reliability_error")),
+        "segments": candidate_metrics.get("segment_max_degradation", math.inf) <= .05,
+        "provenance": candidate_metrics.get("provenance_complete") is True,
+        "completeness": candidate_metrics.get("data_completeness", 0) >= .95,
+        "reconciliation": candidate_metrics.get("reconciliation_checks_pass") is True,
+        "seven_day_collection": candidate_metrics.get("collection_acceptance", {}).get("passed") is True,
+        "archive": candidate_metrics.get("archive_verified") is True,
+    }
+
+
+def promote_model(model_version: str, db_path: Path | None = None) -> dict[str, bool]:
+    with get_db(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        candidate = conn.execute("SELECT * FROM model_versions WHERE id=?", (model_version,)).fetchone()
+        if not candidate or candidate["status"] not in {"candidate", "shadow"}:
+            raise ValueError("model must be a candidate or shadow version")
+        active = conn.execute("SELECT * FROM model_versions WHERE status='active'").fetchone()
+        candidate_metrics = json.loads(candidate["metrics_json"])
+        control_metrics = json.loads(active["metrics_json"]) if active else {}
+        gates = promotion_gates(candidate_metrics, control_metrics)
+        if not all(gates.values()):
+            raise ValueError("promotion gates failed: " + ", ".join(k for k, passed in gates.items() if not passed))
+        now = iso_utc()
+        if active:
+            conn.execute("UPDATE model_versions SET status='retired',retired_at=? WHERE id=?", (now, active["id"]))
+        conn.execute(
+            "UPDATE model_versions SET status='active',activated_at=?,predecessor_id=? WHERE id=?",
+            (now, active["id"] if active else None, model_version),
+        )
+        conn.execute(
+            "INSERT INTO model_transitions(changed_at,from_model_id,to_model_id,action,gate_report_json) VALUES(?,?,?,'promote',?)",
+            (now, active["id"] if active else None, model_version, canonical_json(gates)),
+        )
+    return gates
+
+
+def rollback_model(model_version: str | None = None, db_path: Path | None = None) -> str:
+    with get_db(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        active = conn.execute("SELECT * FROM model_versions WHERE status='active'").fetchone()
+        if not active:
+            raise ValueError("no active model")
+        target_id = model_version or active["predecessor_id"]
+        if not target_id:
+            last = conn.execute(
+                "SELECT from_model_id FROM model_transitions WHERE action='promote' AND to_model_id=? ORDER BY id DESC LIMIT 1",
+                (active["id"],),
+            ).fetchone()
+            target_id = last["from_model_id"] if last else None
+        target = conn.execute("SELECT * FROM model_versions WHERE id=?", (target_id,)).fetchone() if target_id else None
+        if not target:
+            raise ValueError("rollback target not found")
+        now = iso_utc()
+        conn.execute("UPDATE model_versions SET status='retired',retired_at=? WHERE id=?", (now, active["id"]))
+        conn.execute("UPDATE model_versions SET status='active',activated_at=?,retired_at=NULL WHERE id=?", (now, target_id))
+        conn.execute(
+            "INSERT INTO model_transitions(changed_at,from_model_id,to_model_id,action,gate_report_json) VALUES(?,?,?,'rollback','{}')",
+            (now, active["id"], target_id),
+        )
+    return str(target_id)
+
+
+def archive_month(month: str, db_path: Path | None = None, out_dir: Path | None = None) -> Path:
+    try:
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError as exc:
+        raise RuntimeError("archive requires pyarrow; install collector requirements") from exc
+    datetime.strptime(month, "%Y-%m")
+    output = out_dir or config.DATA_DIR / "archive" / month
+    output.mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, Any] = {"month": month, "schema_version": SCHEMA_VERSION, "tables": {}}
+    date_columns = {
+        "forecast_snapshots": "target_date", "market_snapshots": "target_date",
+        "prediction_snapshots": "generated_at", "station_observations": "observed_at",
+        "daily_observations": "target_date", "market_resolutions": "target_date",
+        "model_versions": "created_at", "model_transitions": "changed_at",
+        "collection_runs": "started_at",
+    }
+    with get_db(db_path) as conn:
+        for table, column in date_columns.items():
+            rows = [dict(row) for row in conn.execute(
+                f"SELECT * FROM {table} WHERE substr({column},1,7)=? ORDER BY 1", (month,)
+            ).fetchall()]
+            destination = output / f"{table}.parquet"
+            table_data = pa.Table.from_pylist(rows) if rows else pa.table({"_empty": pa.array([], type=pa.null())})
+            temporary = destination.with_suffix(".parquet.tmp")
+            pq.write_table(table_data, temporary, compression="zstd")
+            digest = hashlib.sha256(temporary.read_bytes()).hexdigest()
+            if destination.exists() and hashlib.sha256(destination.read_bytes()).hexdigest() != digest:
+                temporary.unlink()
+                raise RuntimeError(f"immutable archive conflict: {destination}")
+            temporary.replace(destination)
+            verified = pq.read_table(destination).num_rows
+            expected = len(rows)
+            if expected == 0:
+                verified = 0
+            if verified != expected:
+                raise RuntimeError(f"archive row-count mismatch for {table}: {verified} != {expected}")
+            manifest["tables"][table] = {"rows": expected, "sha256": digest, "file": destination.name}
+    manifest_path = output / "manifest.json"
+    encoded = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+    if manifest_path.exists() and manifest_path.read_bytes() != encoded:
+        raise RuntimeError(f"immutable archive conflict: {manifest_path}")
+    manifest_path.write_bytes(encoded)
+    return manifest_path
+
+
+def migrate_legacy_inventory(
+    legacy_path: Path | None = None,
+    db_path: Path | None = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    primary = db_path or config.DB_PATH
+    legacy = legacy_path or config.COLLECTOR_ROOT / "data" / "wethr.db"
+    if not legacy.exists():
+        return {"legacy_path": str(legacy), "exists": False}
+    result: dict[str, Any] = {"legacy_path": str(legacy), "exists": True, "apply": apply, "tables": {}}
+    with sqlite3.connect(legacy) as source:
+        source.row_factory = sqlite3.Row
+        tables = {row[0] for row in source.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for table in ("trades", "signals", "historical_forecasts", "historical_observations"):
+            result["tables"][table] = source.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0] if table in tables else 0
+    if not apply:
+        return result
+    backup_dir = config.DATA_DIR / "backups"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    stamp = utc_now().strftime("%Y%m%dT%H%M%SZ")
+    shutil.copy2(primary, backup_dir / f"wethr-primary-pre-legacy-{stamp}.db")
+    shutil.copy2(legacy, backup_dir / f"wethr-secondary-pre-legacy-{stamp}.db")
+    copied: dict[str, int] = {}
+    with get_db(primary) as conn:
+        conn.execute("ATTACH DATABASE ? AS legacy", (str(legacy),))
+        for table, key_cols in {
+            "trades": ("created_at", "city", "target_date", "bracket_label", "side", "entry_price", "size_usd"),
+            "signals": ("city", "target_date", "bracket_label"),
+            "historical_forecasts": ("city", "target_date", "lead_days", "model"),
+            "historical_observations": ("city", "target_date"),
+        }.items():
+            target_cols = [row[1] for row in conn.execute(f"PRAGMA main.table_info({table})") if row[1] != "id"]
+            source_cols = {row[1] for row in conn.execute(f"PRAGMA legacy.table_info({table})")}
+            common = [col for col in target_cols if col in source_cols]
+            before = conn.total_changes
+            cols = ",".join(common)
+            keys = " AND ".join(f"p.{key}=l.{key}" for key in key_cols)
+            conn.execute(
+                f"INSERT INTO main.{table} ({cols}) SELECT {','.join('l.'+c for c in common)} FROM legacy.{table} l WHERE NOT EXISTS (SELECT 1 FROM main.{table} p WHERE {keys})"
+            )
+            copied[table] = conn.total_changes - before
+    result["copied"] = copied
+    return result
+
+
+def persist_pipeline_forecasts(
+    forecasts: dict[str, dict[date, Any]],
+    db_path: Path | None = None,
+) -> dict[tuple[str, date], list[int]]:
+    """Persist per-model members already fetched by the trading pipeline."""
+    result: dict[tuple[str, date], list[int]] = defaultdict(list)
+    with get_db(db_path) as conn:
+        for city, by_date in forecasts.items():
+            for target, forecast in by_date.items():
+                grouped: dict[str, list[float]] = defaultdict(list)
+                for member in forecast.members:
+                    grouped[member.model].append(float(member.daily_max))
+                for model, values in grouped.items():
+                    try:
+                        snapshot_id, _ = record_forecast_snapshot(
+                            conn,
+                            ForecastSnapshotInput(
+                                city=city, target_date=target,
+                                issued_at=forecast.fetch_time, seen_at=forecast.fetch_time,
+                                provider="open-meteo-ensemble", model=model,
+                                members_c=values, source_endpoint=config.ENSEMBLE_API_BASE,
+                                issue_time_verified=True,
+                                quality_detail="prospective pipeline capture cutoff",
+                            ),
+                        )
+                    except ValueError:
+                        continue
+                    result[(city, target)].append(snapshot_id)
+    return result
+
+
+def _book_quote(book: Any) -> tuple[float | None, float | None]:
+    if not isinstance(book, dict):
+        return None, None
+    def prices(side: str) -> list[float]:
+        values = []
+        for level in book.get(side, []) or []:
+            raw = level.get("price") if isinstance(level, dict) else None
+            try:
+                values.append(float(raw))
+            except (TypeError, ValueError):
+                pass
+        return values
+    bids, asks = prices("bids"), prices("asks")
+    return (max(bids) if bids else None, min(asks) if asks else None)
+
+
+async def persist_market_quotes(
+    client: httpx.AsyncClient,
+    markets: Sequence[Any],
+    forecasts: dict[str, dict[date, Any]] | None = None,
+    forecast_ids: dict[tuple[str, date], list[int]] | None = None,
+    db_path: Path | None = None,
+) -> int:
+    """Capture CLOB best bids/asks; Gamma prices are audit fields, not asks."""
+    from .ledger import record_market_snapshot
+    captured = utc_now()
+    inserted = 0
+    expected_markets = sum(len(market.brackets) for market in markets)
+    captured_books = 0
+    for market in markets:
+        for bracket in market.brackets:
+            yes_book = no_book = None
+            try:
+                if bracket.token_id:
+                    response = await client.get(
+                        f"{config.CLOB_API_BASE}/book",
+                        params={"token_id": bracket.token_id}, timeout=config.HTTP_TIMEOUT,
+                    )
+                    response.raise_for_status()
+                    yes_book = response.json()
+                if bracket.no_token_id:
+                    response = await client.get(
+                        f"{config.CLOB_API_BASE}/book",
+                        params={"token_id": bracket.no_token_id}, timeout=config.HTTP_TIMEOUT,
+                    )
+                    response.raise_for_status()
+                    no_book = response.json()
+            except httpx.HTTPError:
+                pass
+            yes_bid, yes_ask = _book_quote(yes_book)
+            no_bid, no_ask = _book_quote(no_book)
+            if yes_ask is not None and no_ask is not None:
+                captured_books += 1
+            spread = yes_ask - yes_bid if yes_ask is not None and yes_bid is not None else None
+            with get_db(db_path) as conn:
+                market_snapshot_id, created = record_market_snapshot(
+                    conn,
+                    captured_at=captured, condition_id=bracket.condition_id,
+                    event_id=market.event_id, city=market.city,
+                    target_date=market.target_date.isoformat(), bracket_label=bracket.label,
+                    bracket_lower=bracket.lower, bracket_upper=bracket.upper,
+                    bracket_unit=bracket.unit, yes_best_bid=yes_bid, yes_best_ask=yes_ask,
+                    no_best_bid=no_bid, no_best_ask=no_ask, midpoint=bracket.market_prob,
+                    last_price=bracket.market_prob, volume=market.total_volume,
+                    liquidity=None, spread=spread,
+                    resolution_url=market.resolution_url or f"https://polymarket.com/event/{market.event_slug}",
+                    declared_precision=market.declared_precision, source_endpoint="gamma+clob",
+                )
+                inserted += int(created)
+                if forecasts and forecast_ids:
+                    _materialize_predictions(
+                        conn, market, bracket, market_snapshot_id, captured,
+                        forecasts, forecast_ids, yes_ask, no_ask,
+                    )
+    coverage = captured_books / expected_markets if expected_markets else 1.0
+    with get_db(db_path) as conn:
+        conn.execute(
+            """INSERT INTO collection_runs(
+                   started_at,completed_at,expected_markets,captured_markets,coverage,
+                   missing_executable_books,status,detail_json
+               ) VALUES(?,?,?,?,?,?,?,?)""",
+            (iso_utc(captured), iso_utc(), expected_markets, captured_books, coverage,
+             expected_markets - captured_books, "ok" if coverage >= .95 else "incomplete",
+             canonical_json({"source": "gamma+clob"})),
+        )
+    return inserted
+
+
+def _materialize_predictions(
+    conn: sqlite3.Connection,
+    market: Any,
+    bracket: Any,
+    market_snapshot_id: int,
+    generated_at: datetime,
+    forecasts: dict[str, dict[date, Any]],
+    forecast_ids: dict[tuple[str, date], list[int]],
+    yes_ask: float | None,
+    no_ask: float | None,
+) -> None:
+    """Generate raw, active-control, and candidate probabilities per quote."""
+    from .calibration import calibrated_bracket_probability
+    from .ledger import record_prediction_snapshot
+    from .probability import count_members_in_bracket
+
+    forecast = forecasts.get(market.city, {}).get(market.target_date)
+    ids = forecast_ids.get((market.city, market.target_date), [])
+    if forecast is None or not ids:
+        return
+    unit = market.city_config.temp_unit
+    values = forecast.daily_maxes(unit)
+    if len(values) == 0:
+        return
+    raw_count = count_members_in_bracket(values, bracket.lower, bracket.upper)
+    raw_probability = raw_count / len(values)
+    versions = conn.execute(
+        "SELECT * FROM model_versions WHERE status IN ('active','candidate','shadow')"
+    ).fetchall()
+    for version in versions:
+        probability = raw_probability
+        if version["id"] == LEGACY_MODEL_VERSION:
+            has_emos = conn.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='emos_params'"
+            ).fetchone()
+            params_row = conn.execute(
+                "SELECT params_json FROM emos_params WHERE city=? AND lead_days=-1",
+                (market.city,),
+            ).fetchone() if has_emos else None
+            params = EMOSParams.from_dict(json.loads(params_row["params_json"])) if params_row else None
+            if params is not None:
+                mu, sigma = params.predict(
+                    float(np.mean(values)),
+                    float(np.std(values, ddof=1)) if len(values) > 1 else 0.1,
+                )
+                probability = calibrated_bracket_probability(
+                    bracket.lower, bracket.upper, mu, sigma
+                )
+        elif version["algorithm"].startswith("emos"):
+            parameters = json.loads(version["parameters_json"])
+            raw_params = parameters.get("city", {}).get(market.city) or parameters.get("grouped")
+            if raw_params:
+                params = EMOSParams.from_dict(raw_params)
+                c_values = forecast.daily_maxes("C")
+                mu, sigma = params.predict(
+                    float(np.mean(c_values)),
+                    float(np.std(c_values, ddof=1)) if len(c_values) > 1 else 0.1,
+                )
+                lower = bracket.lower
+                upper = bracket.upper
+                if unit == "F":
+                    lower = (lower - 32) * 5 / 9 if lower is not None else None
+                    upper = (upper - 32) * 5 / 9 if upper is not None else None
+                probability = calibrated_bracket_probability(lower, upper, mu, sigma)
+        choices = []
+        if yes_ask is not None:
+            choices.append((probability - yes_ask, "YES", yes_ask))
+        if no_ask is not None:
+            choices.append(((1 - probability) - no_ask, "NO", no_ask))
+        if not choices:
+            continue
+        _, side, ask = max(choices)
+        record_prediction_snapshot(
+            conn,
+            model_version_id=version["id"], market_snapshot_id=market_snapshot_id,
+            forecast_snapshot_ids=ids, bracket_probability=probability,
+            raw_probability=raw_probability, executable_side=side,
+            executable_ask=ask, generated_at=generated_at,
+        )

@@ -9,7 +9,7 @@ A weather prediction market trading system for [Polymarket](https://polymarket.c
 ```
 wethr/
 ├── collector/      # Python trading agent — ensemble forecasts, EMOS calibration,
-│                   #   Kelly sizing, paper trading, settlement against NWS/ERA5
+│                   #   Kelly sizing, paper trading, Gamma settlement, station reconciliation
 ├── n8n-wethr/      # n8n workflows — divergence audit between Polymarket and
 │                   #   Wethr station observations, exported as JSON for VC
 └── data/           # Shared local databases (gitignored)

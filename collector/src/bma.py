@@ -59,6 +59,7 @@ class BMAWeights:
     city: str = ""
     n_samples: int = 0
     temperature: float = 1.0    # Softmax temperature
+    activation_ready: bool = False  # Requires 120 samples per model + per-model EMOS
 
     def get(self, model: str) -> float:
         """Get weight for a model, defaulting to equal-weight if unknown."""
@@ -75,6 +76,7 @@ class BMAWeights:
             "city": self.city,
             "n_samples": self.n_samples,
             "temperature": self.temperature,
+            "activation_ready": self.activation_ready,
         }
 
     @classmethod
@@ -85,6 +87,7 @@ class BMAWeights:
             city=d.get("city", ""),
             n_samples=d.get("n_samples", 0),
             temperature=d.get("temperature", 1.0),
+            activation_ready=d.get("activation_ready", False),
         )
 
 
@@ -108,6 +111,8 @@ def compute_model_crps(
             JOIN historical_observations o
                 ON f.city = o.city AND f.target_date = o.target_date
             WHERE f.city = ? AND f.n_members > 1
+              AND COALESCE(f.quality_status, 'legacy_unverified') = 'ok'
+              AND COALESCE(f.training_eligible, 0) = 1
             ORDER BY f.model
             """,
             (city_slug,),
@@ -131,6 +136,21 @@ def compute_model_crps(
     }
 
 
+def compute_model_sample_counts(city_slug: str, db_path: Path | None = None) -> dict[str, int]:
+    """Count independent reconciled samples by model; legacy rows never count."""
+    with get_db(db_path) as conn:
+        rows = conn.execute(
+            """SELECT model, COUNT(DISTINCT target_date) AS n
+               FROM historical_forecasts
+               WHERE city=? AND n_members>1
+                 AND COALESCE(quality_status, 'legacy_unverified')='ok'
+                 AND COALESCE(training_eligible,0)=1
+               GROUP BY model""",
+            (city_slug,),
+        ).fetchall()
+    return {row["model"]: int(row["n"]) for row in rows}
+
+
 def compute_bma_weights(
     city_slug: str,
     temperature: float = 1.0,
@@ -148,6 +168,8 @@ def compute_bma_weights(
     At temperature→∞, all models get equal weight (current behavior).
     """
     crps_scores = compute_model_crps(city_slug, db_path)
+    sample_counts = compute_model_sample_counts(city_slug, db_path)
+    crps_scores = {m: score for m, score in crps_scores.items() if sample_counts.get(m, 0) >= 120}
 
     if not crps_scores:
         # No historical data — fall back to equal weights
@@ -155,7 +177,9 @@ def compute_bma_weights(
         return BMAWeights(
             weights={m: 1.0 / n for m in config.ENSEMBLE_MODELS},
             city=city_slug,
+            n_samples=min(sample_counts.values(), default=0),
             temperature=temperature,
+            activation_ready=False,
         )
 
     # Softmax weighting: w_i ∝ exp(-CRPS_i / T)
@@ -183,15 +207,12 @@ def compute_bma_weights(
     total = sum(weights.values())
     weights = {m: round(w / total, 4) for m, w in weights.items()}
 
-    n_samples = sum(len(v) for v in [
-        [r for r in [] ]  # placeholder — we already computed means
-    ])
-
     bma = BMAWeights(
         weights=weights,
         crps_scores={m: round(v, 4) for m, v in crps_scores.items()},
         city=city_slug,
-        n_samples=sum(1 for _ in crps_scores.values()),  # number of models
+        n_samples=min((sample_counts.get(m, 0) for m in crps_scores), default=0),
+        activation_ready=False,  # Per-model EMOS is not yet trained; remain shadow
         temperature=temperature,
     )
 

@@ -53,8 +53,8 @@ pip install -r requirements.txt
 # 1. Run diagnostics first — validates each API
 python run.py diagnose
 
-# 2. Train EMOS calibration (fetches ~90 days of historical data)
-python run.py train --all --days 90
+# 2. Inspect the calibration ledger (new candidates need prospective history)
+python run.py collect-status
 
 # 3. One-shot scan to see current edges
 python run.py scan
@@ -78,8 +78,8 @@ Note: `run.py` auto-detects the `.venv` directory and re-execs with the venv Pyt
 | `python run.py settle [YYYY-MM-DD]` | Settle trades (defaults to yesterday) |
 | `python run.py report` | Performance report with Brier score |
 | `python run.py pending` | Show open trades |
-| `python run.py train --city nyc --days 90` | Train EMOS for one city |
-| `python run.py train --all` | Train EMOS for all cities |
+| `python run.py train --city nyc --days 90` | Legacy audit command; unverified rows are excluded |
+| `python run.py train --all` | Legacy audit command; unverified rows are excluded |
 | `python run.py emos` | Show trained EMOS parameters |
 | `python run.py diagnose` | Validate all API endpoints |
 | `python run.py doctor` | Show local DB/export wiring status |
@@ -116,7 +116,7 @@ Why 5%? Full Kelly assumes perfect probability estimates. At 5%, a 2x overestima
 
 ## Settlement
 
-Trades settle against observed daily high temperatures from NWS (US) or Open-Meteo ERA5 reanalysis (international). The `loop` command auto-settles yesterday's trades at the first scan after midnight UTC.
+Trades settle against authoritative Gamma bracket outcomes. NWS and AviationWeather/METAR station observations provide reconciled exact temperatures; Open-Meteo ERA5 is audit-only. The `loop` command retries every unresolved target date daily, regardless of age.
 
 ## Configuration
 
@@ -178,7 +178,9 @@ Pre-live checklist:
 | Source | Data | Auth |
 |--------|------|------|
 | Open-Meteo Ensemble API | 109-member multi-model ensemble forecasts | None |
-| Open-Meteo Historical | Past forecasts + ERA5 observations | None |
+| Open-Meteo Previous Runs | Verifiable fixed-lead deterministic audit summaries | None |
+| NWS + AviationWeather | Open official station observations | None |
+| Open-Meteo ERA5 | Secondary gridded audit only | None |
 | NWS API | US station observations (settlement) | None |
 | Polymarket Gamma API | Market prices + brackets | None |
 | Polymarket CLOB API | Order placement | API key |
@@ -194,3 +196,30 @@ Covers: bracket parsing, ensemble counting, CRPS math, EMOS training, BMA weight
 ## License
 
 MIT
+
+## Calibration-grade ledger
+
+The operational source of truth is now the additive immutable ledger in the
+same SQLite database. Legacy `signals`, `trades`, and `historical_*` rows remain
+available to old reports, are labeled `legacy-v0` / `legacy_unverified`, and are
+excluded from automatic EMOS/BMA training.
+
+```bash
+python run.py collect-status
+python run.py backfill --from 2026-07-01 --to 2026-07-20
+python run.py reconcile --date 2026-07-19
+python run.py train-candidate --lead-bucket 24_48h
+python run.py evaluate MODEL_VERSION
+python run.py promote MODEL_VERSION
+python run.py rollback
+python run.py archive --month 2026-06
+python run.py migrate-legacy --dry-run
+```
+
+`promote` changes only the active **paper** model and refuses activation until
+all chronological, Gamma-outcome, continuous-truth, completeness, shadow-time,
+and segment gates pass. It never enables live trading. Forecast snapshots store
+complete member values and verified prospective capture cutoffs; deterministic
+Previous Runs summaries are retained for audit but marked untrainable. Gamma is
+authoritative for bracket scoring, while NWS/METAR station readings are used for
+reconciled continuous targets. Open-Meteo ERA5 remains audit-only.

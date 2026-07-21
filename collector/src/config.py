@@ -86,6 +86,8 @@ class CityConfig:
     timezone: str
     temp_unit: str         # "F" or "C" — what Polymarket brackets use
     gamma_tag: str = ""    # Search term for Gamma API
+    resolution_adapter: str = "auto"  # nws, metar, or a dedicated official adapter
+    precision: float = 1.0        # Market rounding increment
 
 CITIES: dict[str, CityConfig] = {
     "nyc": CityConfig(

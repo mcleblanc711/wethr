@@ -184,6 +184,10 @@ def init_db(db_path: Path | None = None) -> None:
                 updated_at TEXT NOT NULL DEFAULT (datetime('now'))
             )
         """)
+        # Additive calibration ledger migration. Existing report tables stay
+        # intact and are explicitly tagged as legacy provenance.
+        from .ledger import init_calibration_ledger
+        init_calibration_ledger(conn)
     log.info(f"Database initialized: {db_path or config.DB_PATH}")
 
 
@@ -207,6 +211,8 @@ def record_paper_trade(
     ps: PositionSize,
     market_volume: float = 0.0,
     db_path: Path | None = None,
+    model_version_id: str | None = None,
+    prediction_snapshot_id: int | None = None,
 ) -> int | None:
     """
     Record a paper trade with city/date context. Returns trade ID,
@@ -233,6 +239,23 @@ def record_paper_trade(
             )
             return None
 
+        if model_version_id is None:
+            active = conn.execute("SELECT id FROM model_versions WHERE status='active'").fetchone()
+            model_version_id = active["id"] if active else "legacy-emos-2026-04-08"
+        if prediction_snapshot_id is None:
+            prediction = conn.execute(
+                """
+                SELECT p.id FROM prediction_snapshots p
+                JOIN market_snapshots m ON m.id=p.market_snapshot_id
+                WHERE p.model_version_id=? AND m.city=? AND m.target_date=?
+                  AND m.bracket_label=?
+                ORDER BY p.generated_at DESC LIMIT 1
+                """,
+                (model_version_id, city, target_date.isoformat(), b.label),
+            ).fetchone()
+            prediction_snapshot_id = prediction["id"] if prediction else None
+
+
         cursor = conn.execute(
             """
             INSERT INTO trades (
@@ -241,8 +264,8 @@ def record_paper_trade(
                 model_prob, market_prob, edge,
                 member_count, total_members, confidence,
                 kelly_full, kelly_frac, token_id, condition_id,
-                market_volume
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                market_volume, model_version_id, prediction_snapshot_id, strategy_version
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'legacy-v0')
             """,
             (
                 city,
@@ -265,6 +288,8 @@ def record_paper_trade(
                 b.token_id,
                 b.condition_id,
                 market_volume,
+                model_version_id,
+                prediction_snapshot_id,
             ),
         )
         trade_id = cursor.lastrowid
