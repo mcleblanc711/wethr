@@ -48,10 +48,55 @@ class WeatherMarket:
     brackets: list[Bracket] = field(default_factory=list)
     total_volume: float = 0.0
     active: bool = True
+    resolution_url: str = ""
+    declared_station: str | None = None
+    declared_precision: float | None = None
 
     @property
     def city_config(self) -> config.CityConfig | None:
         return config.CITIES.get(self.city)
+
+
+def extract_resolution_metadata(event: dict, city_slug: str) -> tuple[str, str | None, float | None]:
+    """Extract declared source URL, station text, and rounding precision."""
+    markets = event.get("markets", []) or []
+    combined = "\n".join(str(value) for value in (
+        event.get("description", ""), event.get("title", ""),
+        *(market.get("description", "") for market in markets),
+    ))
+    resolution_url = str(event.get("resolutionSource") or "")
+    if not resolution_url:
+        for market in markets:
+            if market.get("resolutionSource"):
+                resolution_url = str(market["resolutionSource"])
+                break
+    if not resolution_url:
+        match = re.search(r"https?://[^\s)]+", combined)
+        resolution_url = match.group(0).rstrip(".,") if match else ""
+    station_match = re.search(
+        r"(?:weather station at|station(?: located)? at|reported by)\s+([^.;\n]+)",
+        combined, re.IGNORECASE,
+    )
+    declared_station = station_match.group(1).strip() if station_match else None
+    configured_station = config.CITIES.get(city_slug).station if city_slug in config.CITIES else None
+    if declared_station is None and configured_station and configured_station.lower() in combined.lower():
+        declared_station = configured_station
+    lower = combined.lower()
+    if "nearest tenth" in lower or "one decimal" in lower or "0.1 degree" in lower:
+        precision = 0.1
+    elif "nearest whole" in lower or "whole degree" in lower or "integer" in lower:
+        precision = 1.0
+    else:
+        # Deliberately not inferred from CityConfig: guessing the rounding rule
+        # would silently decide whether station truth matches the winning
+        # bracket. Surface it so the market can be fixed or excluded — the
+        # count is reported by collection_status as missing_resolution_metadata.
+        precision = None
+        log.warning(
+            f"No declared rounding precision for {city_slug}; market cannot "
+            f"reconcile against station truth until the rule is known"
+        )
+    return resolution_url, declared_station, precision
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +521,8 @@ def parse_events_to_markets(events: list[dict]) -> list[WeatherMarket]:
 
         city_cfg = config.CITIES[city_slug]
 
+        resolution_url, declared_station, declared_precision = extract_resolution_metadata(event, city_slug)
+
         wm = WeatherMarket(
             event_id=event_id,
             event_slug=slug,
@@ -483,6 +530,9 @@ def parse_events_to_markets(events: list[dict]) -> list[WeatherMarket]:
             target_date=target,
             question=title,
             total_volume=float(event.get("volume", 0) or 0),
+            resolution_url=resolution_url,
+            declared_station=declared_station,
+            declared_precision=declared_precision,
         )
 
         # Parse each sub-market as a bracket

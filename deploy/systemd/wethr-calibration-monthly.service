@@ -1,0 +1,8 @@
+[Unit]
+Description=Wethr monthly immutable archive and candidate training
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/projects/wethr/collector
+Environment=WETHR_LIVE=0
+ExecStart=%h/projects/wethr/collector/.venv/bin/python %h/projects/wethr/collector/scripts/monthly_calibration.py

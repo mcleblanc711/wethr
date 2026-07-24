@@ -35,6 +35,8 @@ SETTLED_EXPORT_COLUMNS = (
     "outcome",
     "settled_at",
     "market_volume",
+    "model_version_id",
+    "prediction_snapshot_id",
 )
 
 
@@ -173,6 +175,22 @@ def doctor_report() -> str:
             count = "missing" if summary.count is None else str(summary.count)
             latest = f", latest={summary.latest}" if summary.latest else ""
             lines.append(f"  {summary.name}: {count}{latest}")
+
+    from .calibration_ops import collection_status
+    status = collection_status(db_path)
+    lines.append("")
+    lines.append("calibration ledger:")
+    lines.append(f"  forecast freshness: {status['forecast_freshness_minutes']} minutes")
+    lines.append(f"  stale: {status['forecast_stale']}")
+    lines.append(f"  member-count failures: {len(status['member_count_failures'])}")
+    lines.append(f"  unresolved dates: {len(status['unresolved_dates'])} ({len(status['unresolved_older_than_3d'])} older than 3d)")
+    lines.append(f"  reconciliation discrepancies: {status['reconciliation_discrepancies']}")
+    lines.append(f"  7d scan coverage: {status['scan_coverage_7d']:.1%} across {status['scan_days_7d']} day(s)")
+    lines.append(f"  archive: {status['archive_latest'] or 'missing'} (verified={status['archive_verified']})")
+    active = [model['id'] for model in status['models'] if model['status'] == 'active']
+    shadow = [model['id'] for model in status['models'] if model['status'] in {'candidate', 'shadow'}]
+    lines.append(f"  active model: {active[0] if active else 'none'}")
+    lines.append(f"  candidate/shadow models: {', '.join(shadow) if shadow else 'none'}")
 
     lines.append("")
     lines.append("n8n expected mount: n8n-wethr/wethr-output -> /data/wethr")

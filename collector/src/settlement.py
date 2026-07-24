@@ -309,18 +309,25 @@ async def settle_date(
         else:
             signals_remaining.append(signal)
 
-    # Compute and store resolved_value (winning bracket midpoint) for EMOS training
+    # Legacy compatibility: only singleton whole-degree brackets have an
+    # exact rounded value. Ranges and tails remain intervals and must never be
+    # converted to fabricated midpoint temperatures.
+    from .ledger import exact_value_for_interval
     for city, winning_label in city_winning_bracket.items():
         lower, upper, unit = parse_bracket_label(winning_label)
-        if lower is not None and upper is not None:
-            resolved_value = (lower + upper) / 2.0
-        elif lower is not None:
-            # "X or higher" tail — use lower + 0.5
-            resolved_value = lower + 0.5
-        elif upper is not None:
-            # "X or below" tail — use upper - 0.5
-            resolved_value = upper - 0.5
-        else:
+        city_cfg = config.CITIES.get(city)
+        precision = city_cfg.precision if city_cfg else 1.0
+        resolved_value = exact_value_for_interval(lower, upper, precision)
+        if resolved_value is None:
+            # Multi-degree and tail brackets have no exact temperature, and
+            # inventing a midpoint is exactly what this rework removed. But it
+            # does mean this city/day yields no signal training sample, which
+            # should be visible rather than silent.
+            log.warning(
+                f"No exact temperature for {city} {target_date}: winning bracket "
+                f"{winning_label!r} is wider than {precision:g}°{unit}; "
+                f"no signal training sample from this day"
+            )
             continue
 
         with get_db(db_path) as conn:
@@ -332,7 +339,7 @@ async def settle_date(
                 (resolved_value, city, target_date.isoformat()),
             )
         log.debug(
-            f"  Resolved value for {city} {target_date}: "
+            f"  Exact rounded value for {city} {target_date}: "
             f"{resolved_value:.1f}°{unit} (bracket: {winning_label})"
         )
 

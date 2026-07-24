@@ -1,0 +1,9 @@
+[Unit]
+Description=Run Wethr archive and candidate training monthly
+
+[Timer]
+OnCalendar=monthly
+Persistent=true
+
+[Install]
+WantedBy=timers.target
