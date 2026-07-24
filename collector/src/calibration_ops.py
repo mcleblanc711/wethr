@@ -8,6 +8,7 @@ import math
 import shutil
 import sqlite3
 from collections import Counter, defaultdict
+from contextlib import nullcontext
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
@@ -47,8 +48,7 @@ log = logging.getLogger(__name__)
 PREVIOUS_RUNS_URL = "https://previous-runs-api.open-meteo.com/v1/forecast"
 AVIATION_WEATHER_URL = "https://aviationweather.gov/api/data/metar"
 LEAD_BUCKETS = ("in_day", "0_24h", "24_48h", "48_72h", "72h_plus")
-# Beyond this age an unresolved market is abandoned rather than retried forever.
-UNRESOLVED_RETRY_DAYS = 30
+RETRY_BACKOFF_MAX_DAYS = 7
 
 
 def _parse_timestamp(value: Any, *, assume_utc: bool = False) -> datetime | None:
@@ -390,8 +390,9 @@ def _cities_for_date(conn: sqlite3.Connection, target: date) -> list[str]:
         """
         SELECT DISTINCT city FROM signals WHERE target_date=?
         UNION SELECT DISTINCT city FROM trades WHERE target_date=?
+        UNION SELECT DISTINCT city FROM market_snapshots WHERE target_date=?
         """,
-        (target.isoformat(), target.isoformat()),
+        (target.isoformat(), target.isoformat(), target.isoformat()),
     ).fetchall()
     return [str(row["city"]) for row in rows if row["city"] in config.CITIES]
 
@@ -416,7 +417,7 @@ async def backfill_range(
                 summary["resolution_failures"] += 1
             for city_slug in cities:
                 try:
-                    if config.CITIES[city_slug].station.startswith("K"):
+                    if config.CITIES[city_slug].resolution_adapter == "nws":
                         summary["station_readings"] += await collect_nws_observations(
                             client, city_slug, current, db_path
                         )
@@ -433,6 +434,19 @@ async def backfill_range(
                     summary["forecast_summaries"] += result["inserted"]
                 except httpx.HTTPError:
                     summary["forecast_failures"] += 1
+            reconciliation = reconcile_all(current, db_path)
+            summary.update({f"reconciled_{key}": value for key, value in reconciliation.items()})
+            with get_db(db_path) as conn:
+                for city_slug in cities:
+                    row = conn.execute(
+                        """SELECT reconciliation_status FROM market_resolutions
+                           WHERE city=? AND target_date=? ORDER BY resolved_at,id LIMIT 1""",
+                        (city_slug, current.isoformat()),
+                    ).fetchone()
+                    record_resolution_retry(
+                        conn, city_slug, current,
+                        str(row["reconciliation_status"] if row else "resolution_missing"),
+                    )
             current += timedelta(days=1)
     return dict(summary)
 
@@ -452,51 +466,113 @@ def reconcile_all(target: date | None = None, db_path: Path | None = None) -> di
 
 
 _UNRESOLVED_SQL = """
-    SELECT DISTINCT x.target_date FROM (
-        SELECT target_date FROM trades WHERE settled=0
-        UNION SELECT target_date FROM signals WHERE outcome IS NULL
-    ) x
-    LEFT JOIN market_resolutions r ON r.target_date=x.target_date
-    WHERE r.id IS NULL AND x.target_date {comparison} ?
-    ORDER BY x.target_date
+    WITH expected AS (
+        SELECT city,target_date FROM trades
+        UNION SELECT city,target_date FROM signals
+        UNION SELECT city,target_date FROM market_snapshots
+    )
+    SELECT e.city,e.target_date,s.attempt_count,s.last_attempt_at,s.last_result,
+           s.next_retry_at
+    FROM expected e
+    LEFT JOIN resolution_retry_state s
+      ON s.city=e.city AND s.target_date=e.target_date
+    WHERE NOT EXISTS (
+        SELECT 1 FROM market_resolutions r
+        WHERE r.city=e.city AND r.target_date=e.target_date
+          AND r.reconciliation_status='matched'
+          AND r.reconciled_daily_observation_id IS NOT NULL
+    )
+    ORDER BY e.target_date,e.city
 """
 
 
-def _unresolved(
-    db_path: Path | None,
-    comparison: str,
-    max_age_days: int,
+def unresolved_city_dates(
+    db_path: Path | None = None,
+    *,
     now: datetime | None = None,
-) -> list[date]:
-    cutoff = ((now or utc_now()).date() - timedelta(days=max_age_days)).isoformat()
+    due_only: bool = False,
+) -> list[dict[str, Any]]:
+    now = now or utc_now()
     with get_db(db_path) as conn:
-        rows = conn.execute(
-            _UNRESOLVED_SQL.format(comparison=comparison), (cutoff,)
-        ).fetchall()
-    return [date.fromisoformat(row["target_date"]) for row in rows]
+        rows = conn.execute(_UNRESOLVED_SQL).fetchall()
+    items = []
+    for row in rows:
+        next_retry = str(row["next_retry_at"] or iso_utc(now))
+        if due_only and parse_utc(next_retry) > now:
+            continue
+        items.append({
+            "city": str(row["city"]),
+            "target_date": str(row["target_date"]),
+            "attempt_count": int(row["attempt_count"] or 0),
+            "last_attempt_at": row["last_attempt_at"],
+            "last_result": row["last_result"],
+            "next_retry_at": next_retry,
+        })
+    return items
+
+
+def record_resolution_retry(
+    conn: sqlite3.Connection,
+    city: str,
+    target: date,
+    result: str,
+    *,
+    now: datetime | None = None,
+) -> None:
+    now = now or utc_now()
+    matched = conn.execute(
+        """SELECT 1 FROM market_resolutions
+           WHERE city=? AND target_date=? AND reconciliation_status='matched'
+             AND reconciled_daily_observation_id IS NOT NULL LIMIT 1""",
+        (city, target.isoformat()),
+    ).fetchone()
+    if matched:
+        conn.execute(
+            "DELETE FROM resolution_retry_state WHERE city=? AND target_date=?",
+            (city, target.isoformat()),
+        )
+        return
+    previous = conn.execute(
+        "SELECT attempt_count FROM resolution_retry_state WHERE city=? AND target_date=?",
+        (city, target.isoformat()),
+    ).fetchone()
+    attempts = int(previous["attempt_count"] if previous else 0) + 1
+    delay_days = min(2 ** (attempts - 1), RETRY_BACKOFF_MAX_DAYS)
+    conn.execute(
+        """INSERT INTO resolution_retry_state(
+               city,target_date,attempt_count,last_attempt_at,last_result,next_retry_at
+           ) VALUES(?,?,?,?,?,?)
+           ON CONFLICT(city,target_date) DO UPDATE SET
+               attempt_count=excluded.attempt_count,
+               last_attempt_at=excluded.last_attempt_at,
+               last_result=excluded.last_result,
+               next_retry_at=excluded.next_retry_at""",
+        (city, target.isoformat(), attempts, iso_utc(now), result,
+         iso_utc(now + timedelta(days=delay_days))),
+    )
 
 
 def unresolved_target_dates(
     db_path: Path | None = None,
-    max_age_days: int = UNRESOLVED_RETRY_DAYS,
+    max_age_days: int | None = None,
     now: datetime | None = None,
 ) -> list[date]:
-    """Dates still worth retrying.
-
-    Some markets never resolve on Gamma. Retrying them forever grows the daily
-    sweep without bound — every entry costs a full round of network calls — so
-    the window is capped and older dates move to ``abandoned_target_dates``.
-    """
-    return _unresolved(db_path, ">=", max_age_days, now)
+    """All retry-due dates; no unresolved city/date is ever abandoned."""
+    del max_age_days
+    return sorted({
+        date.fromisoformat(item["target_date"])
+        for item in unresolved_city_dates(db_path, now=now, due_only=True)
+    })
 
 
 def abandoned_target_dates(
     db_path: Path | None = None,
-    max_age_days: int = UNRESOLVED_RETRY_DAYS,
+    max_age_days: int | None = None,
     now: datetime | None = None,
 ) -> list[date]:
-    """Unresolved dates past the retry window: reported once, no longer retried."""
-    return _unresolved(db_path, "<", max_age_days, now)
+    """Compatibility shim: schema v3 never permanently abandons retries."""
+    del db_path, max_age_days, now
+    return []
 
 
 def collection_status(db_path: Path | None = None, now: datetime | None = None) -> dict[str, Any]:
@@ -504,16 +580,17 @@ def collection_status(db_path: Path | None = None, now: datetime | None = None) 
     with get_db(db_path) as conn:
         counts = table_counts(conn)
         latest = conn.execute(
-            "SELECT MAX(last_seen_at) AS value FROM forecast_snapshots WHERE quality_status='ok'"
+            "SELECT MAX(last_seen_at) AS value FROM forecast_snapshots WHERE quality_status='ok' AND schema_version=3"
         ).fetchone()["value"]
         member_rows = conn.execute(
             """SELECT model, member_count, quality_status, last_seen_at
-               FROM forecast_snapshots WHERE id IN (
-                 SELECT MAX(id) FROM forecast_snapshots GROUP BY city, model
+               FROM forecast_snapshots WHERE schema_version=3 AND id IN (
+                 SELECT MAX(id) FROM forecast_snapshots WHERE schema_version=3 GROUP BY city, model
                ) ORDER BY model"""
         ).fetchall()
-        unresolved = unresolved_target_dates(db_path, now=now)
-        abandoned = abandoned_target_dates(db_path, now=now)
+        unresolved_items = unresolved_city_dates(db_path, now=now)
+        unresolved = sorted({date.fromisoformat(item["target_date"]) for item in unresolved_items})
+        retry_due = unresolved_target_dates(db_path, now=now)
         discrepancies = int(conn.execute(
             "SELECT COUNT(*) AS n FROM market_resolutions WHERE reconciliation_status='discrepancy'"
         ).fetchone()["n"])
@@ -524,7 +601,7 @@ def collection_status(db_path: Path | None = None, now: datetime | None = None) 
                WHERE reconciliation_status='missing_resolution_metadata'"""
         ).fetchone()["n"])
         models = [dict(row) for row in conn.execute(
-            "SELECT id,status,algorithm,lead_bucket,created_at FROM model_versions ORDER BY created_at"
+            "SELECT id,status,algorithm,lead_basis,lead_bucket,created_at FROM model_versions ORDER BY created_at"
         ).fetchall()]
         recent_runs = conn.execute(
             "SELECT COUNT(DISTINCT substr(completed_at,1,10)) AS days, "
@@ -540,7 +617,11 @@ def collection_status(db_path: Path | None = None, now: datetime | None = None) 
         expected = config.MODEL_MEMBER_COUNTS.get(row["model"])
         if expected is not None and row["member_count"] < expected:
             expected_missing.append({"model": row["model"], "expected": expected, "actual": row["member_count"]})
-    old_unresolved = [d.isoformat() for d in unresolved if (now.date() - d).days > 3]
+    old_items = [
+        item for item in unresolved_items
+        if (now.date() - date.fromisoformat(item["target_date"])).days > 3
+    ]
+    old_unresolved = sorted({item["target_date"] for item in old_items})
     expected = int(recent_runs["expected"] or 0)
     captured = int(recent_runs["captured"] or 0)
     archive_manifests = sorted((config.DATA_DIR / "archive").glob("????-??/manifest.json"))
@@ -550,8 +631,10 @@ def collection_status(db_path: Path | None = None, now: datetime | None = None) 
         "forecast_stale": freshness_minutes is None or freshness_minutes > 30,
         "member_count_failures": expected_missing,
         "unresolved_dates": [d.isoformat() for d in unresolved],
+        "unresolved_items": unresolved_items,
+        "retry_due_dates": [d.isoformat() for d in retry_due],
         "unresolved_older_than_3d": old_unresolved,
-        "abandoned_dates": [d.isoformat() for d in abandoned],
+        "unresolved_items_older_than_3d": old_items,
         "reconciliation_discrepancies": discrepancies,
         "missing_resolution_metadata": missing_metadata,
         "models": models,
@@ -583,14 +666,49 @@ def chronological_rolling_splits(
     return splits[:folds], holdout
 
 
-def _independent_rows(rows: Iterable[sqlite3.Row]) -> list[sqlite3.Row]:
-    latest: dict[tuple[str, str], sqlite3.Row] = {}
+def _pooled_rows(rows: Iterable[sqlite3.Row]) -> list[dict[str, Any]]:
+    """Pool every provider/model member array from one capture sighting.
+
+    A training observation is one city/day/route/cutoff, matching the pooled
+    ensemble distribution used by serving. Only the latest eligible sighting
+    for each city/day in the requested route is retained.
+    """
+    sightings: dict[tuple[str, str, str, str, str], list[sqlite3.Row]] = defaultdict(list)
     for row in rows:
-        key = (str(row["city"]), str(row["target_date"]))
+        key = (
+            str(row["city"]), str(row["target_date"]), str(row["lead_basis"]),
+            str(row["lead_bucket"]), str(row["issued_at"]),
+        )
+        sightings[key].append(row)
+    pooled: list[dict[str, Any]] = []
+    for group in sightings.values():
+        values = [
+            float(value)
+            for row in group
+            for value in json.loads(row["member_values_json"])
+        ]
+        if len(values) < 2:
+            continue
+        item = dict(group[0])
+        item.update({
+            "id": min(int(row["id"]) for row in group),
+            "snapshot_ids": sorted(int(row["id"]) for row in group),
+            "provider": "pooled",
+            "model": "pooled",
+            "member_count": len(values),
+            "member_values_json": canonical_json(values),
+            "mean_c": float(np.mean(values)),
+            "std_c": float(np.std(values, ddof=1)),
+            "spread_c": max(values) - min(values),
+        })
+        pooled.append(item)
+    latest: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for row in pooled:
+        key = (str(row["city"]), str(row["target_date"]), str(row["lead_bucket"]))
         old = latest.get(key)
         if old is None or parse_utc(row["issued_at"]) > parse_utc(old["issued_at"]):
             latest[key] = row
-    return sorted(latest.values(), key=lambda r: (r["target_date"], r["city"]))
+    return sorted(latest.values(), key=lambda row: (row["target_date"], row["city"]))
 
 
 def _training_data(rows: Sequence[sqlite3.Row]) -> TrainingData:
@@ -713,7 +831,9 @@ def dataset_quality(
         f"""SELECT COUNT(*) AS total,
                    SUM(CASE WHEN city IS NULL OR target_date IS NULL OR provider IS NULL
                                  OR model IS NULL OR source_endpoint IS NULL
-                                 OR canonical_hash IS NULL OR issued_at IS NULL
+                                 OR canonical_hash IS NULL OR content_hash IS NULL
+                                 OR sighting_identity IS NULL OR schema_version != 3
+                                 OR issued_at IS NULL
                                  OR lead_basis IS NULL OR lead_basis NOT IN
                                     ('run_time','capture_cutoff')
                             THEN 1 ELSE 0 END) AS missing
@@ -756,12 +876,20 @@ def dataset_quality(
     }
 
 
-def train_candidate(lead: str | None = None, db_path: Path | None = None) -> str:
-    if lead is not None and lead not in LEAD_BUCKETS:
+def train_candidate(
+    lead: str,
+    db_path: Path | None = None,
+    lead_basis: str = "capture_cutoff",
+) -> str:
+    if lead not in LEAD_BUCKETS:
         raise ValueError(f"invalid lead bucket: {lead}")
+    if lead_basis not in {"run_time", "capture_cutoff"}:
+        raise ValueError(f"invalid lead basis: {lead_basis}")
     cutoff = utc_now()
     with get_db(db_path) as conn:
-        rows = _independent_rows(training_forecast_rows(conn, lead_bucket_name=lead, cutoff=cutoff))
+        rows = _pooled_rows(training_forecast_rows(
+            conn, lead_bucket_name=lead, cutoff=cutoff, lead_basis=lead_basis
+        ))
         window_start = (cutoff - timedelta(days=365)).date()
         rows = [row for row in rows if date.fromisoformat(row["target_date"]) >= window_start]
         by_city: dict[str, list[sqlite3.Row]] = defaultdict(list)
@@ -776,7 +904,9 @@ def train_candidate(lead: str | None = None, db_path: Path | None = None) -> str
         grouped_rows = [row for city_rows in included_group.values() for row in city_rows]
         grouped_dates = {row["target_date"] for row in grouped_rows}
         parameters: dict[str, Any] = {"city": {}, "grouped": None}
-        snapshot_ids = [int(row["id"]) for row in rows]
+        snapshot_ids = sorted({
+            snapshot_id for row in rows for snapshot_id in row["snapshot_ids"]
+        })
         metrics: dict[str, Any] = {
             "resolved_dates": len({row["target_date"] for row in rows}),
             "independent_city_days": len(rows),
@@ -809,11 +939,14 @@ def train_candidate(lead: str | None = None, db_path: Path | None = None) -> str
             "independent_city_days": len(rows),
             "sha256": canonical_hash(snapshot_ids),
             "cutoff": iso_utc(cutoff),
+            "lead_basis": lead_basis,
+            "lead_bucket": lead,
             "legacy_tables_included": False,
         }
         body = {
             "algorithm": algorithm,
-            "lead_bucket": lead or "all",
+            "lead_basis": lead_basis,
+            "lead_bucket": lead,
             "parameters": parameters,
             "manifest": manifest,
             "cutoff": iso_utc(cutoff),
@@ -822,14 +955,14 @@ def train_candidate(lead: str | None = None, db_path: Path | None = None) -> str
         conn.execute(
             """
             INSERT OR IGNORE INTO model_versions (
-                id,created_at,algorithm,scope_type,scope_value,lead_bucket,
+                id,created_at,algorithm,scope_type,scope_value,lead_basis,lead_bucket,
                 parameters_json,training_cutoff,dataset_manifest_json,metrics_json,
                 status,schema_version
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,'candidate',?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,'candidate',?)
             """,
             (
                 version_id, iso_utc(), algorithm, "multi-city", "eligible",
-                lead or "all", canonical_json(parameters), iso_utc(cutoff),
+                lead_basis, lead, canonical_json(parameters), iso_utc(cutoff),
                 canonical_json(manifest), canonical_json(metrics), SCHEMA_VERSION,
             ),
         )
@@ -870,8 +1003,9 @@ def operational_acceptance(conn: sqlite3.Connection, now: datetime | None = None
         """SELECT COUNT(*) AS total,
                   SUM(CASE WHEN city IS NULL OR target_date IS NULL OR provider IS NULL
                                 OR model IS NULL OR source_endpoint IS NULL
-                                OR canonical_hash IS NULL THEN 1 ELSE 0 END) AS missing
-           FROM forecast_snapshots WHERE quality_status='ok'"""
+                                OR canonical_hash IS NULL OR content_hash IS NULL
+                                OR sighting_identity IS NULL THEN 1 ELSE 0 END) AS missing
+           FROM forecast_snapshots WHERE quality_status='ok' AND schema_version=3"""
     ).fetchone()
     resolution_rows = conn.execute(
         "SELECT resolved_at,collected_at FROM market_resolutions"
@@ -882,7 +1016,7 @@ def operational_acceptance(conn: sqlite3.Connection, now: datetime | None = None
     )
     resolution_ratio = timely / len(resolution_rows) if resolution_rows else 0.0
     latest = conn.execute(
-        "SELECT MAX(last_seen_at) AS latest FROM forecast_snapshots WHERE quality_status='ok'"
+        "SELECT MAX(last_seen_at) AS latest FROM forecast_snapshots WHERE quality_status='ok' AND schema_version=3"
     ).fetchone()["latest"]
     freshness = (now - parse_utc(latest)).total_seconds() / 60 if latest else math.inf
     result = {
@@ -919,13 +1053,21 @@ def _binary_metrics(probabilities: Sequence[float], outcomes: Sequence[int]) -> 
     return {"n": len(p), "brier": brier, "log_loss": log_loss, "reliability_error": sum(errors) / len(p)}
 
 
-def evaluate_model(model_version: str, db_path: Path | None = None) -> dict[str, Any]:
-    with get_db(db_path) as conn:
+def evaluate_model(
+    model_version: str,
+    db_path: Path | None = None,
+    *,
+    conn: sqlite3.Connection | None = None,
+) -> dict[str, Any]:
+    manager = nullcontext(conn) if conn is not None else get_db(db_path)
+    with manager as conn:
         model = conn.execute("SELECT * FROM model_versions WHERE id=?", (model_version,)).fetchone()
         if not model:
             raise ValueError(f"unknown model version: {model_version}")
-        active_row = conn.execute("SELECT id FROM model_versions WHERE status='active'").fetchone()
-        active_id = active_row["id"] if active_row else None
+        active_row = active_model_for_route(
+            conn, str(model["lead_basis"]), str(model["lead_bucket"])
+        )
+        active_id = active_row["id"]
         predictions = conn.execute(
             """
             SELECT p.*,m.target_date,m.city,m.bracket_lower,m.bracket_upper,m.bracket_unit,
@@ -935,6 +1077,8 @@ def evaluate_model(model_version: str, db_path: Path | None = None) -> dict[str,
             JOIN market_resolutions r ON r.id = (
                 SELECT r2.id FROM market_resolutions r2
                 WHERE r2.city=m.city AND r2.target_date=m.target_date
+                  AND r2.reconciliation_status='matched'
+                  AND r2.reconciled_daily_observation_id IS NOT NULL
                 ORDER BY r2.resolved_at ASC, r2.id ASC LIMIT 1
             )
             WHERE p.model_version_id=? AND p.generated_at < r.resolved_at
@@ -950,9 +1094,11 @@ def evaluate_model(model_version: str, db_path: Path | None = None) -> dict[str,
                     (active_id,),
                 ).fetchall()
             }
-        lead_by_forecast = {
-            int(row["id"]): str(row["lead_bucket"])
-            for row in conn.execute("SELECT id,lead_bucket FROM forecast_snapshots").fetchall()
+        route_by_forecast = {
+            int(row["id"]): (str(row["lead_basis"]), str(row["lead_bucket"]))
+            for row in conn.execute(
+                "SELECT id,lead_basis,lead_bucket FROM forecast_snapshots"
+            ).fetchall()
         }
         probs: list[float] = []
         raw_probs: list[float] = []
@@ -964,6 +1110,12 @@ def evaluate_model(model_version: str, db_path: Path | None = None) -> dict[str,
         city_days: set[tuple[str, str]] = set()
         dates: set[str] = set()
         for row in predictions:
+            forecast_routes = {
+                route_by_forecast.get(int(forecast_id))
+                for forecast_id in json.loads(row["forecast_snapshot_ids_json"])
+            } - {None}
+            if forecast_routes != {(str(model["lead_basis"]), str(model["lead_bucket"]))}:
+                continue
             won = int(
                 row["bracket_unit"] == row["winning_unit"]
                 and row["bracket_lower"] == row["winning_lower"]
@@ -978,11 +1130,7 @@ def evaluate_model(model_version: str, db_path: Path | None = None) -> dict[str,
                 control_probs.append(control_probability)
                 control_outcomes.append(won)
                 segments[f"city:{row['city']}"].append((probability, control_probability, won))
-                buckets = {
-                    lead_by_forecast.get(int(forecast_id))
-                    for forecast_id in json.loads(row["forecast_snapshot_ids_json"])
-                }
-                for bucket in buckets - {None}:
+                for _, bucket in forecast_routes:
                     segments[f"lead:{bucket}"].append((probability, control_probability, won))
             side_won = won if row["executable_side"] == "YES" else 1 - won
             ask = float(row["executable_ask"])
@@ -1075,25 +1223,55 @@ def promotion_gates(candidate_metrics: dict[str, Any], control_metrics: dict[str
 def promote_model(model_version: str, db_path: Path | None = None) -> dict[str, bool]:
     with get_db(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
-        candidate = conn.execute("SELECT * FROM model_versions WHERE id=?", (model_version,)).fetchone()
+        candidate = conn.execute(
+            "SELECT * FROM model_versions WHERE id=?", (model_version,)
+        ).fetchone()
         if not candidate or candidate["status"] not in {"candidate", "shadow"}:
             raise ValueError("model must be a candidate or shadow version")
-        active = conn.execute("SELECT * FROM model_versions WHERE status='active'").fetchone()
-        candidate_metrics = json.loads(candidate["metrics_json"])
-        control_metrics = json.loads(active["metrics_json"]) if active else {}
+        route = (str(candidate["lead_basis"]), str(candidate["lead_bucket"]))
+        if route[0] not in {"run_time", "capture_cutoff"} or route[1] not in LEAD_BUCKETS:
+            raise ValueError("candidate does not declare a promotable lead route")
+
+        evaluated_at = utc_now()
+        candidate_metrics = evaluate_model(
+            model_version, db_path, conn=conn
+        )
+        candidate = conn.execute(
+            "SELECT * FROM model_versions WHERE id=?", (model_version,)
+        ).fetchone()
+        control = active_model_for_route(conn, *route)
+        control_metrics = json.loads(control["metrics_json"] or "{}")
         gates = promotion_gates(candidate_metrics, control_metrics)
+        report = {
+            "evaluated_at": iso_utc(evaluated_at),
+            "route": {"lead_basis": route[0], "lead_bucket": route[1]},
+            "candidate_id": model_version,
+            "control_id": str(control["id"]),
+            "candidate_metrics": candidate_metrics,
+            "control_metrics": control_metrics,
+            "gates": gates,
+        }
         if not all(gates.values()):
-            raise ValueError("promotion gates failed: " + ", ".join(k for k, passed in gates.items() if not passed))
+            raise ValueError(
+                "promotion gates failed: "
+                + ", ".join(key for key, passed in gates.items() if not passed)
+            )
         now = iso_utc()
-        if active:
-            conn.execute("UPDATE model_versions SET status='retired',retired_at=? WHERE id=?", (now, active["id"]))
+        if control["id"] != LEGACY_MODEL_VERSION:
+            conn.execute(
+                "UPDATE model_versions SET status='retired',retired_at=? WHERE id=?",
+                (now, control["id"]),
+            )
         conn.execute(
-            "UPDATE model_versions SET status='active',activated_at=?,predecessor_id=? WHERE id=?",
-            (now, active["id"] if active else None, model_version),
+            """UPDATE model_versions
+               SET status='active',activated_at=?,predecessor_id=? WHERE id=?""",
+            (now, control["id"], model_version),
         )
         conn.execute(
-            "INSERT INTO model_transitions(changed_at,from_model_id,to_model_id,action,gate_report_json) VALUES(?,?,?,'promote',?)",
-            (now, active["id"] if active else None, model_version, canonical_json(gates)),
+            """INSERT INTO model_transitions(
+                   changed_at,from_model_id,to_model_id,action,gate_report_json
+               ) VALUES(?,?,?,'promote',?)""",
+            (now, control["id"], model_version, canonical_json(report)),
         )
     return gates
 
@@ -1101,7 +1279,11 @@ def promote_model(model_version: str, db_path: Path | None = None) -> dict[str, 
 def rollback_model(model_version: str | None = None, db_path: Path | None = None) -> str:
     with get_db(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
-        active = conn.execute("SELECT * FROM model_versions WHERE status='active'").fetchone()
+        active = conn.execute(
+            """SELECT * FROM model_versions WHERE status='active'
+               AND lead_basis IN ('run_time','capture_cutoff')
+               ORDER BY activated_at DESC,id DESC LIMIT 1"""
+        ).fetchone()
         if not active:
             raise ValueError("no active model")
         target_id = model_version or active["predecessor_id"]
@@ -1114,9 +1296,18 @@ def rollback_model(model_version: str | None = None, db_path: Path | None = None
         target = conn.execute("SELECT * FROM model_versions WHERE id=?", (target_id,)).fetchone() if target_id else None
         if not target:
             raise ValueError("rollback target not found")
+        if target["id"] != LEGACY_MODEL_VERSION and (
+            target["lead_basis"] != active["lead_basis"]
+            or target["lead_bucket"] != active["lead_bucket"]
+        ):
+            raise ValueError("rollback target belongs to a different lead route")
         now = iso_utc()
         conn.execute("UPDATE model_versions SET status='retired',retired_at=? WHERE id=?", (now, active["id"]))
-        conn.execute("UPDATE model_versions SET status='active',activated_at=?,retired_at=NULL WHERE id=?", (now, target_id))
+        if target_id != LEGACY_MODEL_VERSION:
+            conn.execute(
+                "UPDATE model_versions SET status='active',activated_at=?,retired_at=NULL WHERE id=?",
+                (now, target_id),
+            )
         conn.execute(
             "INSERT INTO model_transitions(changed_at,from_model_id,to_model_id,action,gate_report_json) VALUES(?,?,?,'rollback','{}')",
             (now, active["id"], target_id),
@@ -1146,30 +1337,68 @@ def archive_month(month: str, db_path: Path | None = None, out_dir: Path | None 
         "prediction_snapshots": "generated_at", "station_observations": "observed_at",
         "daily_observations": "target_date", "market_resolutions": "target_date",
         "model_versions": "created_at", "model_transitions": "changed_at",
-        "collection_runs": "started_at",
+        "collection_runs": "started_at", "resolution_retry_state": "target_date",
     }
     revision_dir = output / f"r{revision}"
-    revision_dir.mkdir(parents=True, exist_ok=True)
     tables: dict[str, Any] = {}
     with get_db(db_path) as conn:
-        # A month is only finalizable once every resolution in it has been
-        # reconciled; archiving earlier bakes in a partition we know is unfinished.
-        pending = int(conn.execute(
+        cohort = conn.execute(
+            """WITH expected AS (
+                   SELECT city,target_date FROM trades
+                   UNION SELECT city,target_date FROM signals
+                   UNION SELECT city,target_date FROM market_snapshots
+               )
+               SELECT e.city,e.target_date,COUNT(r.id) AS resolution_count,
+                      SUM(CASE WHEN r.reconciliation_status='matched'
+                                AND r.reconciled_daily_observation_id IS NOT NULL
+                               THEN 1 ELSE 0 END) AS matched_count
+               FROM expected e
+               LEFT JOIN market_resolutions r
+                 ON r.city=e.city AND r.target_date=e.target_date
+               WHERE substr(e.target_date,1,7)=?
+               GROUP BY e.city,e.target_date
+               ORDER BY e.target_date,e.city""",
+            (month,),
+        ).fetchall()
+        invalid = [
+            dict(row) for row in cohort
+            if int(row["resolution_count"] or 0) != 1
+            or int(row["matched_count"] or 0) != 1
+        ]
+        nonmatched = int(conn.execute(
             """SELECT COUNT(*) AS n FROM market_resolutions
-               WHERE substr(target_date,1,7)=? AND reconciliation_status='pending'""",
+               WHERE substr(target_date,1,7)=?
+                 AND (reconciliation_status!='matched'
+                      OR reconciled_daily_observation_id IS NULL)""",
             (month,),
         ).fetchone()["n"])
-        if pending:
+        if invalid or nonmatched:
             raise RuntimeError(
-                f"{month} still has {pending} unreconciled resolutions; "
-                "run reconcile before archiving"
+                f"{month} is not finalizable under matched-only policy: "
+                f"{len(invalid)} expected city/dates incomplete, "
+                f"{nonmatched} non-matched resolutions"
             )
+        provenance = [dict(row) for row in conn.execute(
+            """SELECT city,target_date,id AS resolution_id,
+                      reconciled_daily_observation_id,normalized_station_id,
+                      resolution_provider,reconciliation_status
+               FROM market_resolutions
+               WHERE substr(target_date,1,7)=? AND reconciliation_status='matched'
+               ORDER BY target_date,city,id""",
+            (month,),
+        ).fetchall()]
+        finalization = {
+            "policy_version": "gamma-station-matched-v1",
+            "expected_city_dates": len(cohort),
+            "accepted_reconciliation_statuses": ["matched"],
+            "matched_expected_city_dates": len(cohort),
+            "reconciliation_provenance": provenance,
+        }
+        revision_dir.mkdir(parents=True, exist_ok=False)
         for table, column in date_columns.items():
             rows = [dict(row) for row in conn.execute(
                 f"SELECT * FROM {table} WHERE substr({column},1,7)=? ORDER BY 1", (month,)
             ).fetchall()]
-            # Independent count: catches a concurrent writer mutating the
-            # partition midway through the export.
             expected = int(conn.execute(
                 f"SELECT COUNT(*) AS n FROM {table} WHERE substr({column},1,7)=?", (month,)
             ).fetchone()["n"])
@@ -1192,15 +1421,13 @@ def archive_month(month: str, db_path: Path | None = None, out_dir: Path | None 
     def content(spec: dict[str, Any]) -> dict[str, tuple[int, str]]:
         return {name: (item["rows"], item["sha256"]) for name, item in spec.items()}
 
-    # Unchanged re-runs are a no-op, so the job stays idempotent. Genuine
-    # changes — a late resolution, a corrected reconciliation — become a new
-    # revision instead of a permanent hard failure that kills the monthly job.
     if previous and content(previous.get("tables", {})) == content(tables):
         shutil.rmtree(revision_dir)
         return manifest_path
     manifest = {
         "month": month, "schema_version": SCHEMA_VERSION, "revision": revision,
         "tables": tables,
+        "finalization": finalization,
         "supersedes": (previous or {}).get("revision"),
     }
     manifest_path.write_bytes((json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode())
@@ -1412,6 +1639,102 @@ async def persist_market_quotes(
     return inserted
 
 
+def _forecast_route(
+    conn: sqlite3.Connection,
+    forecast_ids: Sequence[int],
+) -> tuple[str, str] | None:
+    if not forecast_ids:
+        return None
+    placeholders = ",".join("?" for _ in forecast_ids)
+    rows = conn.execute(
+        f"""SELECT DISTINCT lead_basis,lead_bucket FROM forecast_snapshots
+            WHERE id IN ({placeholders}) AND schema_version=?
+              AND content_hash IS NOT NULL AND sighting_identity IS NOT NULL""",
+        [*map(int, forecast_ids), SCHEMA_VERSION],
+    ).fetchall()
+    routes = {(str(row["lead_basis"]), str(row["lead_bucket"])) for row in rows}
+    return next(iter(routes)) if len(routes) == 1 else None
+
+
+def active_model_for_route(
+    conn: sqlite3.Connection,
+    lead_basis: str,
+    lead_bucket_name: str,
+) -> sqlite3.Row:
+    model = conn.execute(
+        """SELECT * FROM model_versions
+           WHERE status='active' AND lead_basis=? AND lead_bucket=?
+           ORDER BY activated_at DESC,id LIMIT 1""",
+        (lead_basis, lead_bucket_name),
+    ).fetchone()
+    if model is None:
+        model = conn.execute(
+            "SELECT * FROM model_versions WHERE id=?", (LEGACY_MODEL_VERSION,)
+        ).fetchone()
+    if model is None:
+        raise RuntimeError("legacy control model is unavailable")
+    return model
+
+
+def selected_model_versions(
+    forecast_ids: dict[tuple[str, date], list[int]],
+    db_path: Path | None = None,
+) -> dict[tuple[str, date], str]:
+    selected: dict[tuple[str, date], str] = {}
+    with get_db(db_path) as conn:
+        for key, ids in forecast_ids.items():
+            route = _forecast_route(conn, ids)
+            model = active_model_for_route(conn, *route) if route else conn.execute(
+                "SELECT * FROM model_versions WHERE id=?", (LEGACY_MODEL_VERSION,)
+            ).fetchone()
+            if model:
+                selected[key] = str(model["id"])
+    return selected
+
+
+def apply_routed_probabilities(
+    probabilities: Any,
+    model_version_id: str,
+    db_path: Path | None = None,
+) -> Any:
+    """Overlay the selected route model probabilities on the served brackets."""
+    if model_version_id == LEGACY_MODEL_VERSION:
+        return probabilities
+    from .probability import BracketProbability
+
+    market = probabilities.market
+    with get_db(db_path) as conn:
+        rows = conn.execute(
+            """SELECT m.bracket_label,p.bracket_probability
+               FROM prediction_snapshots p
+               JOIN market_snapshots m ON m.id=p.market_snapshot_id
+               WHERE p.model_version_id=? AND m.city=? AND m.target_date=?
+               ORDER BY p.generated_at DESC,p.id DESC""",
+            (model_version_id, market.city, market.target_date.isoformat()),
+        ).fetchall()
+    routed: dict[str, float] = {}
+    for row in rows:
+        routed.setdefault(str(row["bracket_label"]), float(row["bracket_probability"]))
+    if not routed:
+        return probabilities
+    probabilities.brackets = [
+        BracketProbability(
+            bracket=bp.bracket,
+            model_prob=routed.get(bp.bracket.label, bp.model_prob),
+            market_prob=bp.market_prob,
+            edge=routed.get(bp.bracket.label, bp.model_prob) - bp.market_prob,
+            member_count=bp.member_count,
+            total_members=bp.total_members,
+            confidence=max(
+                routed.get(bp.bracket.label, bp.model_prob),
+                1.0 - routed.get(bp.bracket.label, bp.model_prob),
+            ),
+        )
+        for bp in probabilities.brackets
+    ]
+    return probabilities
+
+
 def _materialize_predictions(
     conn: sqlite3.Connection,
     market: Any,
@@ -1438,10 +1761,17 @@ def _materialize_predictions(
         return
     raw_count = count_members_in_bracket(values, bracket.lower, bracket.upper)
     raw_probability = raw_count / len(values)
+    route = _forecast_route(conn, ids)
     versions = conn.execute(
         "SELECT * FROM model_versions WHERE status IN ('active','candidate','shadow')"
     ).fetchall()
     for version in versions:
+        is_control = version["id"] in {LEGACY_MODEL_VERSION, "raw-ensemble-v1"}
+        if not is_control and (
+            route is None
+            or (str(version["lead_basis"]), str(version["lead_bucket"])) != route
+        ):
+            continue
         probability = raw_probability
         if version["id"] == LEGACY_MODEL_VERSION:
             has_emos = conn.execute(

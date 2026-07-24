@@ -90,34 +90,34 @@ class CityConfig:
     timezone: str
     temp_unit: str         # "F" or "C" — what Polymarket brackets use
     gamma_tag: str = ""    # Search term for Gamma API
-    resolution_adapter: str = "auto"  # nws, metar, or a dedicated official adapter
+    resolution_adapter: str = "aviationweather-metar"  # nws, metar, or a dedicated official adapter
     precision: float = 1.0        # Market rounding increment
 
 CITIES: dict[str, CityConfig] = {
     "nyc": CityConfig(
         name="New York City", slug="nyc", station="KLGA",
         lat=40.77, lon=-73.87, timezone="America/New_York",
-        temp_unit="F", gamma_tag="NYC",
+        temp_unit="F", resolution_adapter="nws", gamma_tag="NYC",
     ),
     "chicago": CityConfig(
         name="Chicago", slug="chicago", station="KORD",
         lat=41.98, lon=-87.90, timezone="America/Chicago",
-        temp_unit="F", gamma_tag="Chicago",
+        temp_unit="F", resolution_adapter="nws", gamma_tag="Chicago",
     ),
     "miami": CityConfig(
         name="Miami", slug="miami", station="KMIA",
         lat=25.79, lon=-80.29, timezone="America/New_York",
-        temp_unit="F", gamma_tag="Miami",
+        temp_unit="F", resolution_adapter="nws", gamma_tag="Miami",
     ),
     "los_angeles": CityConfig(
         name="Los Angeles", slug="los_angeles", station="KLAX",
         lat=33.94, lon=-118.41, timezone="America/Los_Angeles",
-        temp_unit="F", gamma_tag="Los Angeles",
+        temp_unit="F", resolution_adapter="nws", gamma_tag="Los Angeles",
     ),
     "denver": CityConfig(
         name="Denver", slug="denver", station="KDEN",
         lat=39.85, lon=-104.66, timezone="America/Denver",
-        temp_unit="F", gamma_tag="Denver",
+        temp_unit="F", resolution_adapter="nws", gamma_tag="Denver",
     ),
     "london": CityConfig(
         name="London", slug="london", station="EGLC",
@@ -137,17 +137,17 @@ CITIES: dict[str, CityConfig] = {
     "atlanta": CityConfig(
         name="Atlanta", slug="atlanta", station="KATL",
         lat=33.64, lon=-84.43, timezone="America/New_York",
-        temp_unit="F", gamma_tag="Atlanta",
+        temp_unit="F", resolution_adapter="nws", gamma_tag="Atlanta",
     ),
     "dallas": CityConfig(
         name="Dallas", slug="dallas", station="KDFW",
         lat=32.90, lon=-97.04, timezone="America/Chicago",
-        temp_unit="F", gamma_tag="Dallas",
+        temp_unit="F", resolution_adapter="nws", gamma_tag="Dallas",
     ),
     "seattle": CityConfig(
         name="Seattle", slug="seattle", station="KSEA",
         lat=47.45, lon=-122.31, timezone="America/Los_Angeles",
-        temp_unit="F", gamma_tag="Seattle",
+        temp_unit="F", resolution_adapter="nws", gamma_tag="Seattle",
     ),
     # --- New cities seen on Polymarket ---
     "tel_aviv": CityConfig(

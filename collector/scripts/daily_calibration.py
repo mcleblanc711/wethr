@@ -36,10 +36,13 @@ async def run() -> None:
         alerts.append("forecast freshness exceeds 30 minutes")
     if status["member_count_failures"]:
         alerts.append("expected ensemble members are missing")
-    if status["unresolved_older_than_3d"]:
+    if status["unresolved_items_older_than_3d"]:
         alerts.append(
             "unresolved outcomes older than 3 days: "
-            + ", ".join(status["unresolved_older_than_3d"])
+            + ", ".join(
+                f"{item['city']}/{item['target_date']}"
+                for item in status["unresolved_items_older_than_3d"]
+            )
         )
     if status["reconciliation_discrepancies"]:
         alerts.append(

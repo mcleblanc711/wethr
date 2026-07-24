@@ -237,8 +237,7 @@ def record_paper_trade(
             return None
 
         if model_version_id is None:
-            active = conn.execute("SELECT id FROM model_versions WHERE status='active'").fetchone()
-            model_version_id = active["id"] if active else "legacy-emos-2026-04-08"
+            model_version_id = "legacy-emos-2026-04-08"
         if prediction_snapshot_id is None:
             prediction = conn.execute(
                 """

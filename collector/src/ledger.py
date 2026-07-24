@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
@@ -19,7 +20,7 @@ from zoneinfo import ZoneInfo
 
 from . import config
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 LEGACY_MODEL_VERSION = "legacy-emos-2026-04-08"
 LEGACY_PROVENANCE = "legacy-v0"
 QUALITY_OK = "ok"
@@ -35,6 +36,7 @@ LEDGER_TABLES = (
     "model_versions",
     "model_transitions",
     "collection_runs",
+    "resolution_retry_state",
 )
 
 _SCHEMA = """
@@ -44,6 +46,7 @@ CREATE TABLE IF NOT EXISTS model_versions (
     algorithm TEXT NOT NULL,
     scope_type TEXT NOT NULL,
     scope_value TEXT NOT NULL,
+    lead_basis TEXT NOT NULL DEFAULT 'unknown',
     lead_bucket TEXT NOT NULL,
     parameters_json TEXT NOT NULL,
     training_cutoff TEXT,
@@ -56,9 +59,6 @@ CREATE TABLE IF NOT EXISTS model_versions (
     retired_at TEXT,
     schema_version INTEGER NOT NULL DEFAULT 1
 );
-CREATE UNIQUE INDEX IF NOT EXISTS idx_model_one_active
-    ON model_versions(status) WHERE status = 'active';
-
 CREATE TABLE IF NOT EXISTS forecast_snapshots (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     city TEXT NOT NULL,
@@ -90,8 +90,10 @@ CREATE TABLE IF NOT EXISTS forecast_snapshots (
     quality_status TEXT NOT NULL,
     quality_detail TEXT,
     schema_version INTEGER NOT NULL,
+    content_hash TEXT NOT NULL,
+    sighting_identity TEXT NOT NULL UNIQUE,
     canonical_hash TEXT NOT NULL,
-    UNIQUE(city, target_date, provider, model, canonical_hash)
+    UNIQUE(city, target_date, provider, model, sighting_identity)
 );
 CREATE INDEX IF NOT EXISTS idx_forecast_target
     ON forecast_snapshots(target_date, city, lead_bucket);
@@ -202,17 +204,32 @@ CREATE TABLE IF NOT EXISTS market_resolutions (
     exact_rounded_value REAL,
     resolution_url TEXT NOT NULL,
     declared_station TEXT,
+    normalized_station_id TEXT,
+    resolution_provider TEXT,
     declared_precision REAL,
     resolved_at TEXT NOT NULL,
     collected_at TEXT NOT NULL,
     reconciliation_status TEXT NOT NULL,
     reconciliation_detail TEXT,
+    reconciled_daily_observation_id INTEGER REFERENCES daily_observations(id),
     source_json TEXT NOT NULL,
     canonical_hash TEXT NOT NULL UNIQUE,
     schema_version INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_resolution_target
     ON market_resolutions(target_date, city, resolved_at);
+
+CREATE TABLE IF NOT EXISTS resolution_retry_state (
+    city TEXT NOT NULL,
+    target_date TEXT NOT NULL,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    last_attempt_at TEXT,
+    last_result TEXT,
+    next_retry_at TEXT NOT NULL,
+    PRIMARY KEY(city, target_date)
+);
+CREATE INDEX IF NOT EXISTS idx_resolution_retry_due
+    ON resolution_retry_state(next_retry_at, target_date, city);
 
 CREATE TABLE IF NOT EXISTS model_transitions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -384,6 +401,41 @@ def init_calibration_ledger(conn: sqlite3.Connection) -> None:
         "ALTER TABLE forecast_snapshots ADD COLUMN lead_basis TEXT NOT NULL DEFAULT 'unknown'",
     )
     _add_column(
+        conn, "forecast_snapshots", "content_hash",
+        "ALTER TABLE forecast_snapshots ADD COLUMN content_hash TEXT",
+    )
+    _add_column(
+        conn, "forecast_snapshots", "sighting_identity",
+        "ALTER TABLE forecast_snapshots ADD COLUMN sighting_identity TEXT",
+    )
+    _add_column(
+        conn, "model_versions", "lead_basis",
+        "ALTER TABLE model_versions ADD COLUMN lead_basis TEXT NOT NULL DEFAULT 'unknown'",
+    )
+    _add_column(
+        conn, "market_resolutions", "normalized_station_id",
+        "ALTER TABLE market_resolutions ADD COLUMN normalized_station_id TEXT",
+    )
+    _add_column(
+        conn, "market_resolutions", "resolution_provider",
+        "ALTER TABLE market_resolutions ADD COLUMN resolution_provider TEXT",
+    )
+    _add_column(
+        conn, "market_resolutions", "reconciled_daily_observation_id",
+        "ALTER TABLE market_resolutions ADD COLUMN reconciled_daily_observation_id INTEGER REFERENCES daily_observations(id)",
+    )
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_forecast_sighting_identity
+           ON forecast_snapshots(sighting_identity)
+           WHERE sighting_identity IS NOT NULL"""
+    )
+    conn.execute("DROP INDEX IF EXISTS idx_model_one_active")
+    conn.execute(
+        """CREATE UNIQUE INDEX IF NOT EXISTS idx_model_one_active_route
+           ON model_versions(lead_basis, lead_bucket)
+           WHERE status='active' AND lead_basis IN ('run_time','capture_cutoff')"""
+    )
+    _add_column(
         conn, "model_versions", "shadow_since",
         "ALTER TABLE model_versions ADD COLUMN shadow_since TEXT",
     )
@@ -408,10 +460,10 @@ def init_calibration_ledger(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         INSERT OR IGNORE INTO model_versions (
-            id, created_at, algorithm, scope_type, scope_value, lead_bucket,
+            id, created_at, algorithm, scope_type, scope_value, lead_basis, lead_bucket,
             parameters_json, training_cutoff, dataset_manifest_json,
             metrics_json, status, activated_at, schema_version
-        ) VALUES (?, ?, 'legacy-emos', 'global', 'all', 'all', ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, 'legacy-emos', 'global', 'all', 'legacy', 'all', ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             LEGACY_MODEL_VERSION,
@@ -428,12 +480,16 @@ def init_calibration_ledger(conn: sqlite3.Connection) -> None:
     conn.execute(
         """
         INSERT OR IGNORE INTO model_versions (
-            id,created_at,algorithm,scope_type,scope_value,lead_bucket,
+            id,created_at,algorithm,scope_type,scope_value,lead_basis,lead_bucket,
             parameters_json,training_cutoff,dataset_manifest_json,metrics_json,
             status,schema_version
-        ) VALUES ('raw-ensemble-v1',?,'raw-ensemble','global','all','all','{}',NULL,'{"provenance":"member-values"}','{"control":true}','shadow',?)
+        ) VALUES ('raw-ensemble-v1',?,'raw-ensemble','global','all','legacy','all','{}',NULL,'{"provenance":"member-values"}','{"control":true}','shadow',?)
         """,
         (now, SCHEMA_VERSION),
+    )
+    conn.execute(
+        "UPDATE model_versions SET lead_basis='legacy' WHERE id IN (?,?) AND lead_basis='unknown'",
+        (LEGACY_MODEL_VERSION, "raw-ensemble-v1"),
     )
     conn.execute(
         "UPDATE trades SET model_version_id=? WHERE model_version_id IS NULL",
@@ -498,21 +554,22 @@ def record_forecast_snapshot(
     seen = parse_utc(item.seen_at)
     day_start = target_day_start_utc(item.target_date, city.timezone)
     lead = (day_start - issued).total_seconds() / 3600.0
-    payload = {
+    bucket = lead_bucket(lead)
+    content_digest = canonical_hash({"members_c": values})
+    sighting_digest = canonical_hash({
         "city": item.city,
         "target_date": item.target_date.isoformat(),
         "provider": item.provider,
         "model": item.model,
-        "members_c": values,
+        "lead_basis": item.lead_basis,
+        "information_cutoff": iso_utc(issued),
+        "lead_bucket": bucket,
+        "content_hash": content_digest,
         "schema_version": SCHEMA_VERSION,
-    }
-    digest = canonical_hash(payload)
+    })
     existing = conn.execute(
-        """
-        SELECT id FROM forecast_snapshots
-        WHERE city=? AND target_date=? AND provider=? AND model=? AND canonical_hash=?
-        """,
-        (item.city, item.target_date.isoformat(), item.provider, item.model, digest),
+        "SELECT id FROM forecast_snapshots WHERE sighting_identity=?",
+        (sighting_digest,),
     ).fetchone()
     if existing:
         conn.execute(
@@ -522,12 +579,13 @@ def record_forecast_snapshot(
         return int(existing["id"]), False
     version_row = conn.execute(
         """
-        SELECT COALESCE(MAX(content_version), 0) + 1 AS next_version
+        SELECT MIN(CASE WHEN content_hash=? THEN content_version END) AS existing_version,
+               COALESCE(MAX(content_version), 0) + 1 AS next_version
         FROM forecast_snapshots WHERE city=? AND target_date=? AND provider=? AND model=?
         """,
-        (item.city, item.target_date.isoformat(), item.provider, item.model),
+        (content_digest, item.city, item.target_date.isoformat(), item.provider, item.model),
     ).fetchone()
-    content_version = int(version_row["next_version"])
+    content_version = int(version_row["existing_version"] or version_row["next_version"])
     values_mean = mean(values)
     values_std = stdev(values)
     cur = conn.execute(
@@ -539,20 +597,20 @@ def record_forecast_snapshot(
             provider, model, content_version, member_count, member_values_json,
             mean_c, spread_c, std_c, q10_c, q25_c, q50_c, q75_c, q90_c,
             source_endpoint, issue_time_verified, quality_status, quality_detail,
-            schema_version, canonical_hash
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            schema_version, content_hash, sighting_identity, canonical_hash
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             item.city, item.target_date.isoformat(), iso_utc(issued), iso_utc(seen),
             iso_utc(seen), iso_utc(seen), item.lead_basis, city.timezone,
             iso_utc(day_start), lead,
-            lead_bucket(lead), item.provider, item.model, content_version,
+            bucket, item.provider, item.model, content_version,
             len(values), canonical_json(values), values_mean,
             max(values) - min(values), values_std,
             quantile(values, .10), quantile(values, .25), quantile(values, .50),
             quantile(values, .75), quantile(values, .90), item.source_endpoint,
             int(item.issue_time_verified), item.quality_status, item.quality_detail,
-            SCHEMA_VERSION, digest,
+            SCHEMA_VERSION, content_digest, sighting_digest, sighting_digest,
         ),
     )
     return int(cur.lastrowid), True
@@ -690,24 +748,45 @@ def aggregate_daily_observation(
     return int(cur.lastrowid)
 
 
+def normalize_station_id(value: str | None) -> str | None:
+    """Return one explicit four-character station identifier, never a guess."""
+    if not value:
+        return None
+    matches = {match.upper() for match in re.findall(r"(?<![A-Z0-9])[A-Z0-9]{4}(?![A-Z0-9])", value.upper())}
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def official_resolution_provider(city: str) -> str:
+    city_cfg = config.CITIES.get(city)
+    if city_cfg is None or city_cfg.resolution_adapter not in {"nws", "aviationweather-metar"}:
+        raise ValueError(f"unsupported official resolution adapter for {city}")
+    return city_cfg.resolution_adapter
+
+
 def reconcile_resolution(conn: sqlite3.Connection, resolution_id: int) -> str:
     resolution = conn.execute(
         "SELECT * FROM market_resolutions WHERE id=?", (resolution_id,)
     ).fetchone()
     if not resolution:
         raise ValueError(f"resolution {resolution_id} not found")
+    normalized_station = normalize_station_id(resolution["declared_station"])
+    provider = official_resolution_provider(str(resolution["city"]))
+    city_cfg = config.CITIES[str(resolution["city"])]
     daily = conn.execute(
         """
         SELECT * FROM daily_observations
-        WHERE city=? AND target_date=? AND quality_status='ok'
-        ORDER BY revision DESC LIMIT 1
+        WHERE city=? AND target_date=? AND station_id=? AND provider=?
+          AND quality_status='ok'
+        ORDER BY revision DESC, id DESC LIMIT 1
         """,
-        (resolution["city"], resolution["target_date"]),
+        (resolution["city"], resolution["target_date"], normalized_station, provider),
     ).fetchone()
-    if not resolution["declared_station"] or resolution["declared_precision"] is None:
-        status, detail = "missing_resolution_metadata", "Declared station or precision is unavailable"
+    if normalized_station is None or resolution["declared_precision"] is None:
+        status, detail = "missing_resolution_metadata", "Declared station identifier or precision is unavailable"
+    elif normalized_station != city_cfg.station.upper():
+        status, detail = "station_mismatch", f"Declared station {normalized_station} does not match configured station {city_cfg.station}"
     elif not daily:
-        status, detail = "missing_station_truth", "No quality daily station observation"
+        status, detail = "missing_station_truth", f"No quality daily observation for {normalized_station} from {provider}"
     else:
         unit = resolution["winning_unit"]
         value = float(daily["max_temperature_c"])
@@ -726,8 +805,13 @@ def reconcile_resolution(conn: sqlite3.Connection, resolution_id: int) -> str:
                 (daily["id"],),
             )
     conn.execute(
-        "UPDATE market_resolutions SET reconciliation_status=?, reconciliation_detail=? WHERE id=?",
-        (status, detail, resolution_id),
+        """UPDATE market_resolutions
+           SET normalized_station_id=?, resolution_provider=?,
+               reconciliation_status=?, reconciliation_detail=?,
+               reconciled_daily_observation_id=?
+           WHERE id=?""",
+        (normalized_station, provider, status, detail,
+         int(daily["id"]) if daily and status in {"matched", "discrepancy"} else None, resolution_id),
     )
     return status
 
@@ -746,6 +830,9 @@ def training_forecast_rows(
         # different quantities; mixing them inside a lead bucket would make the
         # bucket meaningless.
         "f.lead_basis=?",
+        "f.schema_version=?",
+        "f.content_hash IS NOT NULL",
+        "f.sighting_identity IS NOT NULL",
         "f.quality_status='ok'",
         "f.member_count>=2",
         "d.quality_status='ok'",
@@ -753,7 +840,7 @@ def training_forecast_rows(
         "f.first_seen_at < r.resolved_at",
         "f.issued_at < r.resolved_at",
     ]
-    params: list[Any] = [lead_basis]
+    params: list[Any] = [lead_basis, SCHEMA_VERSION]
     if lead_bucket_name:
         clauses.append("f.lead_bucket=?")
         params.append(lead_bucket_name)
@@ -767,17 +854,17 @@ def training_forecast_rows(
         SELECT f.*, d.max_temperature_c, d.id AS daily_observation_id,
                r.id AS resolution_id, r.resolved_at
         FROM forecast_snapshots f
-        JOIN daily_observations d ON d.id = (
-            SELECT d2.id FROM daily_observations d2
-            WHERE d2.city=f.city AND d2.target_date=f.target_date
-              AND d2.quality_status='ok' AND d2.reconciled=1
-            ORDER BY d2.revision DESC, d2.id DESC LIMIT 1
-        )
         JOIN market_resolutions r ON r.id = (
             SELECT r2.id FROM market_resolutions r2
             WHERE r2.city=f.city AND r2.target_date=f.target_date
+              AND r2.reconciliation_status='matched'
+              AND r2.reconciled_daily_observation_id IS NOT NULL
             ORDER BY r2.resolved_at ASC, r2.id ASC LIMIT 1
         )
+        JOIN daily_observations d ON d.id=r.reconciled_daily_observation_id
+          AND d.city=f.city AND d.target_date=f.target_date
+          AND d.station_id=r.normalized_station_id
+          AND d.provider=r.resolution_provider
         WHERE {' AND '.join(clauses)}
         ORDER BY f.target_date, f.city, f.issued_at
     """
@@ -823,8 +910,9 @@ def record_forecast_summary(
         "schema_version": SCHEMA_VERSION,
     }
     digest = canonical_hash(payload)
+    content_digest = canonical_hash({"value_c": float(value_c)})
     row = conn.execute(
-        "SELECT id FROM forecast_snapshots WHERE canonical_hash=?", (digest,)
+        "SELECT id FROM forecast_snapshots WHERE sighting_identity=?", (digest,)
     ).fetchone()
     if row:
         conn.execute(
@@ -845,8 +933,8 @@ def record_forecast_summary(
             target_day_start_utc,lead_hours,lead_bucket,provider,model,content_version,
             member_count,member_values_json,mean_c,spread_c,std_c,q10_c,q25_c,q50_c,
             q75_c,q90_c,source_endpoint,issue_time_verified,quality_status,
-            quality_detail,schema_version,canonical_hash
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            quality_detail,schema_version,content_hash,sighting_identity,canonical_hash
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             city, target_date.isoformat(), iso_utc(issued), iso_utc(seen), iso_utc(seen),
@@ -855,7 +943,7 @@ def record_forecast_summary(
             version, 1, canonical_json([float(value_c)]), float(value_c), 0.0, 0.0,
             float(value_c), float(value_c), float(value_c), float(value_c), float(value_c),
             source_endpoint, 1, "deterministic_untrainable", quality_detail,
-            SCHEMA_VERSION, digest,
+            SCHEMA_VERSION, content_digest, digest, digest,
         ),
     )
     return int(cur.lastrowid), True
@@ -975,6 +1063,8 @@ def record_market_resolution(
     source: Any,
 ) -> tuple[int, bool]:
     exact = exact_value_for_interval(winning_lower, winning_upper, declared_precision)
+    normalized_station = normalize_station_id(declared_station)
+    resolution_provider = official_resolution_provider(city)
     # Identity only. ``resolved_at`` is derived from Gamma's mutable updatedAt,
     # so hashing it would mint a second row for the same outcome on every
     # re-collection and double-count that market in every metric.
@@ -1003,17 +1093,22 @@ def record_market_resolution(
             else existing["declared_precision"]
         )
         station = declared_station or existing["declared_station"]
+        normalized_station = normalize_station_id(station)
+        earliest_resolved = iso_utc(min(parse_utc(existing["resolved_at"]), parse_utc(resolved_iso)))
         conn.execute(
             """
             UPDATE market_resolutions
-            SET declared_station=?, declared_precision=?, exact_rounded_value=?,
-                resolution_url=?, resolved_at=?, source_json=?
+            SET declared_station=?, normalized_station_id=?, resolution_provider=?,
+                declared_precision=?, exact_rounded_value=?,
+                resolution_url=?, resolved_at=?, source_json=?,
+                reconciliation_status='pending', reconciliation_detail=NULL,
+                reconciled_daily_observation_id=NULL
             WHERE id=?
             """,
             (
-                station, precision,
+                station, normalized_station, resolution_provider, precision,
                 exact_value_for_interval(winning_lower, winning_upper, precision),
-                resolution_url, min(str(existing["resolved_at"]), resolved_iso),
+                resolution_url, earliest_resolved,
                 canonical_json(source), existing["id"],
             ),
         )
@@ -1023,15 +1118,15 @@ def record_market_resolution(
         INSERT INTO market_resolutions (
             event_id,condition_id,city,target_date,winning_label,winning_lower,
             winning_upper,winning_unit,exact_rounded_value,resolution_url,
-            declared_station,declared_precision,resolved_at,collected_at,
-            reconciliation_status,source_json,canonical_hash,schema_version
-        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            declared_station,normalized_station_id,resolution_provider,declared_precision,
+            resolved_at,collected_at,reconciliation_status,source_json,canonical_hash,schema_version
+        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             event_id, condition_id, city, target_date.isoformat(), winning_label,
             winning_lower, winning_upper, winning_unit, exact, resolution_url,
-            declared_station, declared_precision, resolved_iso,
-            iso_utc(parse_utc(collected_at)), "pending", canonical_json(source),
+            declared_station, normalized_station, resolution_provider, declared_precision,
+            resolved_iso, iso_utc(parse_utc(collected_at)), "pending", canonical_json(source),
             digest, SCHEMA_VERSION,
         ),
     )

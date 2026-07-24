@@ -18,7 +18,7 @@ def run() -> None:
     prior = date.today().replace(day=1) - timedelta(days=1)
     month = f"{prior.year:04d}-{prior.month:02d}"
     print(archive_month(month))
-    for bucket in (*LEAD_BUCKETS, None):
+    for bucket in LEAD_BUCKETS:
         print(train_candidate(bucket))
 
 

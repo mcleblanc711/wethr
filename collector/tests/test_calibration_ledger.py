@@ -7,12 +7,13 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 from src.calibration_ops import chronological_rolling_splits, promotion_gates
+from src import config
 from src.history import fetch_historical_ensemble
 from src.ledger import (
     ForecastSnapshotInput, aggregate_daily_observation, exact_value_for_interval,
     lead_bucket, record_forecast_snapshot, record_market_resolution,
     record_market_snapshot, record_station_observation, reconcile_resolution,
-    round_to_precision, training_forecast_rows, value_in_interval,
+    parse_utc, round_to_precision, training_forecast_rows, value_in_interval,
 )
 from src.paper_trader import get_db, init_db
 
@@ -41,16 +42,26 @@ def test_forecast_hash_dedup_and_content_versions(db_path):
     )
     with get_db(db_path) as conn:
         first, created = record_forecast_snapshot(conn, ForecastSnapshotInput(**base))
-        second, created_again = record_forecast_snapshot(conn, ForecastSnapshotInput(
-            **{**base, "run_time": datetime(2026, 7, 20, 1, tzinfo=UTC), "seen_at": datetime(2026, 7, 20, 2, tzinfo=UTC)}
+        duplicate, created_again = record_forecast_snapshot(conn, ForecastSnapshotInput(
+            **{**base, "seen_at": datetime(2026, 7, 20, 2, tzinfo=UTC)}
         ))
-        third, changed = record_forecast_snapshot(conn, ForecastSnapshotInput(
+        other_run, other_run_created = record_forecast_snapshot(conn, ForecastSnapshotInput(
+            **{**base, "run_time": datetime(2026, 7, 20, 1, tzinfo=UTC),
+               "seen_at": datetime(2026, 7, 20, 2, tzinfo=UTC)}
+        ))
+        changed, changed_created = record_forecast_snapshot(conn, ForecastSnapshotInput(
             **{**base, "members_c": [20, 21, 23]}
         ))
-        assert created and not created_again and first == second
-        assert changed and third != first
-        rows = conn.execute("SELECT content_version,last_seen_at FROM forecast_snapshots ORDER BY id").fetchall()
-        assert [row["content_version"] for row in rows] == [1, 2]
+        assert created and not created_again and first == duplicate
+        assert other_run_created and other_run != first
+        assert changed_created and changed not in {first, other_run}
+        rows = conn.execute(
+            """SELECT content_version,last_seen_at,content_hash,sighting_identity
+               FROM forecast_snapshots ORDER BY id"""
+        ).fetchall()
+        assert [row["content_version"] for row in rows] == [1, 1, 2]
+        assert rows[0]["content_hash"] == rows[1]["content_hash"]
+        assert rows[0]["sighting_identity"] != rows[1]["sighting_identity"]
         assert "T02:00:00" in rows[0]["last_seen_at"]
 
 
@@ -105,14 +116,14 @@ def test_snapshot_seen_after_resolution_cannot_train(db_path):
         for hour in range(23):
             value = 25.1 if hour == 14 else 18.0
             record_station_observation(
-                conn, city="london", station_id="EGLC", provider="fixture",
+                conn, city="london", station_id="EGLC", provider="aviationweather-metar",
                 observed_at=datetime(2026, 7, 10, hour, tzinfo=UTC),
                 received_at=datetime(2026, 7, 10, hour, 30, tzinfo=UTC),
                 temperature_c=value, unit_reported="C",
                 source_url="fixture://station", raw={"v": value, "h": hour},
             )
         aggregate_daily_observation(
-            conn, city="london", target_date=target, provider="fixture",
+            conn, city="london", target_date=target, provider="aviationweather-metar",
             station_id="EGLC", declared_precision=1, rounded_unit="C",
         )
         resolution_id, _ = record_market_resolution(
@@ -176,6 +187,17 @@ def test_migration_is_idempotent(db_path):
         assert sum(row["status"] == "active" for row in models) == 1
         cols = {row[1] for row in conn.execute("PRAGMA table_info(trades)")}
         assert {"model_version_id", "prediction_snapshot_id", "strategy_version"} <= cols
+        forecast_cols = {row[1] for row in conn.execute("PRAGMA table_info(forecast_snapshots)")}
+        assert {"content_hash", "sighting_identity", "lead_basis"} <= forecast_cols
+        resolution_cols = {row[1] for row in conn.execute("PRAGMA table_info(market_resolutions)")}
+        assert {
+            "normalized_station_id", "resolution_provider",
+            "reconciled_daily_observation_id",
+        } <= resolution_cols
+        model_cols = {row[1] for row in conn.execute("PRAGMA table_info(model_versions)")}
+        assert "lead_basis" in model_cols
+        indexes = {row[1] for row in conn.execute("PRAGMA index_list(model_versions)")}
+        assert "idx_model_one_active_route" in indexes
 
 
 def _passing_candidate():
@@ -270,14 +292,16 @@ def _seed_station_truth(conn, city, station, target, peak=25.1, hours=23):
     for hour in range(hours):
         value = peak if hour == 14 else peak - 7
         record_station_observation(
-            conn, city=city, station_id=station, provider="fixture",
+            conn, city=city, station_id=station,
+            provider=config.CITIES[city].resolution_adapter,
             observed_at=datetime(target.year, target.month, target.day, hour, tzinfo=UTC),
             received_at=datetime(target.year, target.month, target.day, hour, 30, tzinfo=UTC),
             temperature_c=value, unit_reported="C", source_url="fixture://station",
             raw={"v": value, "h": hour},
         )
     aggregate_daily_observation(
-        conn, city=city, target_date=target, provider="fixture",
+        conn, city=city, target_date=target,
+        provider=config.CITIES[city].resolution_adapter,
         station_id=station, declared_precision=1, rounded_unit="C",
     )
     resolution_id, _ = record_market_resolution(
@@ -362,25 +386,43 @@ def test_partial_day_is_not_station_truth(db_path):
         assert row["quality_status"] == "partial_day"
 
 
-def test_unresolved_sweep_is_bounded(db_path):
-    """Markets that never resolve must leave the daily retry queue, or the
-    sweep grows without bound and costs a network round trip per date forever."""
-    from src.calibration_ops import abandoned_target_dates, unresolved_target_dates
+def test_unresolved_retry_is_city_scoped_indefinite_and_capped(db_path):
+    from src.calibration_ops import (
+        collection_status, record_resolution_retry, unresolved_city_dates,
+        unresolved_target_dates,
+    )
     now = datetime(2026, 7, 20, tzinfo=UTC)
+    target = date(2026, 3, 1)
     with get_db(db_path) as conn:
-        for target in ("2026-07-19", "2026-03-01"):
+        for city in ("london", "paris"):
             conn.execute(
                 """INSERT INTO trades (city,target_date,bracket_label,bracket_unit,
                                        side,entry_price,size_usd,model_prob,
                                        market_prob,edge,member_count,total_members,
                                        confidence,kelly_full,kelly_frac,settled)
-                   VALUES ('london',?,'25°C','C','YES',.4,10,.5,.4,.1,20,50,.8,.1,.05,0)""",
-                (target,),
+                   VALUES (? ,? ,"25C","C","YES",.4,10,.5,.4,.1,20,50,.8,.1,.05,0)""",
+                (city, target.isoformat()),
             )
-    recent = unresolved_target_dates(db_path, now=now)
-    old = abandoned_target_dates(db_path, now=now)
-    assert recent == [date(2026, 7, 19)]
-    assert old == [date(2026, 3, 1)]
+        _seed_station_truth(conn, "london", "EGLC", target)
+
+    items = unresolved_city_dates(db_path, now=now)
+    assert [(item["city"], item["target_date"]) for item in items] == [
+        ("paris", "2026-03-01")
+    ]
+    assert unresolved_target_dates(db_path, now=now) == [target]
+
+    with get_db(db_path) as conn:
+        for _ in range(5):
+            record_resolution_retry(conn, "paris", target, "resolution_missing", now=now)
+        retry = conn.execute(
+            "SELECT * FROM resolution_retry_state WHERE city=?", ("paris",)
+        ).fetchone()
+        assert retry["attempt_count"] == 5
+        assert parse_utc(retry["next_retry_at"]) == now + timedelta(days=7)
+
+    status = collection_status(db_path, now=now)
+    assert status["unresolved_items_older_than_3d"][0]["city"] == "paris"
+    assert "abandoned_dates" not in status
 
 
 def test_archive_revises_instead_of_failing(db_path, tmp_path):
@@ -394,6 +436,12 @@ def test_archive_revises_instead_of_failing(db_path, tmp_path):
     manifest = json.loads(first.read_text())
     assert manifest["revision"] == 1
     assert manifest["tables"]["market_resolutions"]["rows"] == 1
+    assert manifest["schema_version"] == 3
+    assert manifest["finalization"]["policy_version"] == "gamma-station-matched-v1"
+    assert manifest["finalization"]["accepted_reconciliation_statuses"] == ["matched"]
+    assert manifest["finalization"]["reconciliation_provenance"][0][
+        "reconciled_daily_observation_id"
+    ]
 
     # Re-running unchanged is a no-op, so the job stays idempotent.
     archive_month("2026-07", db_path=db_path, out_dir=out)
@@ -422,7 +470,7 @@ def test_archive_refuses_unreconciled_month(db_path, tmp_path):
             resolved_at=datetime(2026, 7, 11, tzinfo=UTC),
             collected_at=datetime(2026, 7, 11, tzinfo=UTC), source={},
         )
-    with pytest.raises(RuntimeError, match="unreconciled"):
+    with pytest.raises(RuntimeError, match="matched-only"):
         archive_month("2026-07", db_path=db_path, out_dir=tmp_path / "a")
 
 
@@ -487,3 +535,314 @@ def test_resolution_recollection_does_not_duplicate(db_path):
         assert row["declared_precision"] == 1
         assert row["exact_rounded_value"] == 25
         assert row["resolved_at"].startswith("2026-07-11")
+
+
+# --------------------------------------------------------------------------
+# Schema-v3 review blocker regressions
+# --------------------------------------------------------------------------
+
+def _seed_daily_observation(conn, city, station, provider, target, peak=25.1):
+    for hour in range(23):
+        value = peak if hour == 14 else peak - 7
+        record_station_observation(
+            conn, city=city, station_id=station, provider=provider,
+            observed_at=datetime(target.year, target.month, target.day, hour, tzinfo=UTC),
+            received_at=datetime(target.year, target.month, target.day, hour, 30, tzinfo=UTC),
+            temperature_c=value, unit_reported="C", source_url="fixture://station",
+            raw={"provider": provider, "hour": hour},
+        )
+    return aggregate_daily_observation(
+        conn, city=city, target_date=target, provider=provider,
+        station_id=station, declared_precision=1, rounded_unit="C",
+    )
+
+
+def _insert_route_model(conn, model_id, basis, bucket, status="candidate"):
+    conn.execute(
+        """INSERT INTO model_versions(
+               id,created_at,algorithm,scope_type,scope_value,lead_basis,lead_bucket,
+               parameters_json,training_cutoff,dataset_manifest_json,metrics_json,
+               status,shadow_since,schema_version
+           ) VALUES(?,"2026-07-01T00:00:00Z","raw-ensemble-fallback","global","all",
+                    ?,?,"{}",NULL,"{}","{}",?,"2026-07-01T00:00:00Z",3)""",
+        (model_id, basis, bucket, status),
+    )
+
+
+def test_identical_content_distinguishes_cutoffs_buckets_and_bases(db_path):
+    target = date(2026, 7, 22)
+    common = dict(
+        city="london", target_date=target, provider="fixture", model="eps",
+        members_c=[20, 21, 22], source_endpoint="fixture://ensemble",
+    )
+    with get_db(db_path) as conn:
+        ids = [record_forecast_snapshot(conn, ForecastSnapshotInput(**item))[0] for item in (
+            {**common, "seen_at": datetime(2026, 7, 20, 12, tzinfo=UTC)},
+            {**common, "seen_at": datetime(2026, 7, 21, 12, tzinfo=UTC)},
+            {**common, "seen_at": datetime(2026, 7, 20, 12, tzinfo=UTC),
+             "run_time": datetime(2026, 7, 20, 12, tzinfo=UTC)},
+        )]
+        rows = conn.execute(
+            "SELECT lead_basis,lead_bucket,content_hash,sighting_identity FROM forecast_snapshots"
+        ).fetchall()
+    assert len(set(ids)) == 3
+    assert len({row["content_hash"] for row in rows}) == 1
+    assert len({row["sighting_identity"] for row in rows}) == 3
+    assert {row["lead_basis"] for row in rows} == {"capture_cutoff", "run_time"}
+    assert len({row["lead_bucket"] for row in rows}) >= 2
+
+
+def test_wrong_station_and_wrong_provider_never_reconcile_or_train(db_path):
+    target = date(2026, 7, 10)
+    with get_db(db_path) as conn:
+        _seed_daily_observation(
+            conn, "london", "EGLL", "aviationweather-metar", target
+        )
+        wrong_station, _ = record_market_resolution(
+            conn, event_id="wrong-station", condition_id="c1", city="london",
+            target_date=target, winning_label="25C", winning_lower=25,
+            winning_upper=26, winning_unit="C", resolution_url="fixture://gamma",
+            declared_station="weather station EGLL", declared_precision=1,
+            resolved_at=datetime(2026, 7, 11, tzinfo=UTC),
+            collected_at=datetime(2026, 7, 11, 1, tzinfo=UTC), source={},
+        )
+        assert reconcile_resolution(conn, wrong_station) == "station_mismatch"
+        assert conn.execute(
+            "SELECT reconciled_daily_observation_id FROM market_resolutions WHERE id=?",
+            (wrong_station,),
+        ).fetchone()[0] is None
+
+        _seed_daily_observation(conn, "london", "EGLC", "nws", target)
+        wrong_provider, _ = record_market_resolution(
+            conn, event_id="wrong-provider", condition_id="c2", city="london",
+            target_date=target, winning_label="25C", winning_lower=25,
+            winning_upper=26, winning_unit="C", resolution_url="fixture://gamma",
+            declared_station="EGLC", declared_precision=1,
+            resolved_at=datetime(2026, 7, 11, tzinfo=UTC),
+            collected_at=datetime(2026, 7, 11, 1, tzinfo=UTC), source={},
+        )
+        assert reconcile_resolution(conn, wrong_provider) == "missing_station_truth"
+        record_forecast_snapshot(conn, ForecastSnapshotInput(
+            city="london", target_date=target,
+            seen_at=datetime(2026, 7, 9, tzinfo=UTC), provider="fixture",
+            model="eps", members_c=[24, 25, 26], source_endpoint="fixture://ensemble",
+        ))
+        assert training_forecast_rows(conn, lead_basis="capture_cutoff") == []
+
+
+def test_pooled_sighting_combines_provider_model_members(db_path):
+    from src.calibration_ops import _pooled_rows
+
+    target = date(2026, 7, 10)
+    seen = datetime(2026, 7, 9, tzinfo=UTC)
+    with get_db(db_path) as conn:
+        _seed_station_truth(conn, "london", "EGLC", target)
+        for provider, model, members in (
+            ("provider-a", "model-a", [23, 24, 25]),
+            ("provider-b", "model-b", [25, 26, 27]),
+        ):
+            record_forecast_snapshot(conn, ForecastSnapshotInput(
+                city="london", target_date=target, seen_at=seen,
+                provider=provider, model=model, members_c=members,
+                source_endpoint=f"fixture://{provider}",
+            ))
+        rows = training_forecast_rows(
+            conn, lead_bucket_name="0_24h", lead_basis="capture_cutoff"
+        )
+        pooled = _pooled_rows(rows)
+    assert len(rows) == 2 and len(pooled) == 1
+    assert pooled[0]["member_count"] == 6
+    assert len(pooled[0]["snapshot_ids"]) == 2
+    assert pooled[0]["mean_c"] == pytest.approx(25.0)
+
+
+@pytest.mark.parametrize(("first", "second", "expected"), [
+    ("2026-07-11T00:00:00.500000Z", "2026-07-11T00:00:00Z", "2026-07-11T00:00:00Z"),
+    ("2026-07-11T01:00:00+01:00", "2026-07-11T00:30:00Z", "2026-07-11T00:00:00Z"),
+    ("2026-07-11T00:00:00Z", "2026-07-11T00:00:00.500000Z", "2026-07-11T00:00:00Z"),
+])
+def test_resolution_time_minimization_uses_datetimes(db_path, first, second, expected):
+    identity = dict(
+        event_id="event", condition_id="condition", city="london",
+        target_date=date(2026, 7, 10), winning_label="25C", winning_lower=25,
+        winning_upper=26, winning_unit="C", resolution_url="fixture://gamma",
+        declared_station="EGLC", declared_precision=1,
+        collected_at=datetime(2026, 7, 12, tzinfo=UTC), source={},
+    )
+    with get_db(db_path) as conn:
+        resolution_id, _ = record_market_resolution(
+            conn, resolved_at=parse_utc(first), **identity
+        )
+        record_market_resolution(conn, resolved_at=parse_utc(second), **identity)
+        stored = conn.execute(
+            "SELECT resolved_at FROM market_resolutions WHERE id=?", (resolution_id,)
+        ).fetchone()[0]
+    assert parse_utc(stored) == parse_utc(expected)
+
+
+def test_archive_refuses_expected_city_date_without_resolution(db_path, tmp_path):
+    pytest.importorskip("pyarrow")
+    from src.calibration_ops import archive_month
+
+    with get_db(db_path) as conn:
+        conn.execute(
+            """INSERT INTO trades (city,target_date,bracket_label,bracket_unit,
+                                   side,entry_price,size_usd,model_prob,market_prob,
+                                   edge,member_count,total_members,confidence,
+                                   kelly_full,kelly_frac,settled)
+               VALUES ("london","2026-07-10","25C","C","YES",.4,10,.5,.4,
+                       .1,20,50,.8,.1,.05,0)"""
+        )
+    out = tmp_path / "archive"
+    with pytest.raises(RuntimeError, match="expected city/dates incomplete"):
+        archive_month("2026-07", db_path=db_path, out_dir=out)
+    assert not (out / "r1").exists()
+
+
+def test_train_candidate_has_no_all_route(db_path):
+    from src.calibration_ops import train_candidate
+
+    with pytest.raises(ValueError, match="invalid lead bucket"):
+        train_candidate(None, db_path=db_path)  # type: ignore[arg-type]
+    with get_db(db_path) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM model_versions WHERE status=? AND lead_bucket=?",
+            ("candidate", "all")
+        ).fetchone()[0] == 0
+
+
+def test_materialization_and_active_selection_are_route_specific(db_path):
+    from src.calibration_ops import (
+        _materialize_predictions, active_model_for_route, selected_model_versions,
+    )
+    from src.ensemble import EnsembleForecast, EnsembleMember
+    from src.markets import Bracket, WeatherMarket
+
+    target = date(2026, 7, 22)
+    seen = datetime(2026, 7, 21, 12, tzinfo=UTC)
+    forecast = EnsembleForecast(
+        city_slug="london", target_date=target, fetch_time=seen,
+        members=[
+            EnsembleMember("a", 0, 20, 68), EnsembleMember("a", 1, 21, 69.8),
+            EnsembleMember("b", 0, 22, 71.6),
+        ],
+    )
+    market = WeatherMarket(
+        event_id="event", event_slug="event", city="london", target_date=target,
+        question="temperature", declared_station="EGLC", declared_precision=1,
+    )
+    bracket = Bracket("yes", "20-22C", 20, 22, "C", .4, "condition", "no")
+    market.brackets = [bracket]
+    with get_db(db_path) as conn:
+        ids = []
+        for model, values in (("a", [20, 21]), ("b", [22, 23])):
+            snapshot_id, _ = record_forecast_snapshot(conn, ForecastSnapshotInput(
+                city="london", target_date=target, seen_at=seen,
+                provider="fixture", model=model, members_c=values,
+                source_endpoint="fixture://ensemble",
+            ))
+            ids.append(snapshot_id)
+        route = conn.execute(
+            "SELECT lead_basis,lead_bucket FROM forecast_snapshots WHERE id=?", (ids[0],)
+        ).fetchone()
+        _insert_route_model(conn, "candidate-exact", route["lead_basis"], route["lead_bucket"])
+        _insert_route_model(conn, "candidate-other", route["lead_basis"], "48_72h")
+        market_id, _ = record_market_snapshot(
+            conn, captured_at=seen, condition_id="condition", event_id="event",
+            city="london", target_date=target.isoformat(), bracket_label=bracket.label,
+            bracket_lower=20, bracket_upper=22, bracket_unit="C", yes_best_bid=.39,
+            yes_best_ask=.4, no_best_bid=.59, no_best_ask=.6, midpoint=.4,
+            last_price=.4, volume=100, liquidity=50, spread=.01,
+            resolution_url="fixture://rules", declared_precision=1,
+            source_endpoint="fixture://market",
+        )
+        _materialize_predictions(
+            conn, market, bracket, market_id, seen,
+            {"london": {target: forecast}}, {("london", target): ids}, .4, .6,
+        )
+        candidate_ids = {
+            row[0] for row in conn.execute(
+                "SELECT DISTINCT model_version_id FROM prediction_snapshots WHERE model_version_id LIKE ?",
+                ("candidate-%",)
+            )
+        }
+        assert candidate_ids == {"candidate-exact"}
+        conn.execute("UPDATE model_versions SET status=? WHERE id=?", ("active", "candidate-exact"))
+        conn.execute("UPDATE model_versions SET status=? WHERE id=?", ("active", "candidate-other"))
+        assert active_model_for_route(conn, route["lead_basis"], route["lead_bucket"])["id"] == "candidate-exact"
+        assert active_model_for_route(conn, "run_time", route["lead_bucket"])["id"] == "legacy-emos-2026-04-08"
+    assert selected_model_versions({("london", target): ids}, db_path)[("london", target)] == "candidate-exact"
+
+
+def test_promotion_recomputes_reconciliation_inside_transaction(db_path, monkeypatch):
+    import src.calibration_ops as ops
+
+    target = date(2026, 7, 10)
+    with get_db(db_path) as conn:
+        _seed_station_truth(conn, "london", "EGLC", target)
+        snapshot_id, _ = record_forecast_snapshot(conn, ForecastSnapshotInput(
+            city="london", target_date=target, seen_at=datetime(2026, 7, 9, tzinfo=UTC),
+            provider="fixture", model="eps", members_c=[24, 25, 26],
+            source_endpoint="fixture://ensemble",
+        ))
+        row = conn.execute(
+            "SELECT lead_basis,lead_bucket FROM forecast_snapshots WHERE id=?", (snapshot_id,)
+        ).fetchone()
+        _insert_route_model(conn, "fresh-evidence", row["lead_basis"], row["lead_bucket"], "shadow")
+        conn.execute(
+            "UPDATE model_versions SET dataset_manifest_json=? WHERE id=?",
+            (json.dumps({"forecast_snapshot_ids": [snapshot_id]}), "fresh-evidence"),
+        )
+        discrepancy, _ = record_market_resolution(
+            conn, event_id="late-discrepancy", condition_id="late", city="london",
+            target_date=target, winning_label="30C", winning_lower=30,
+            winning_upper=31, winning_unit="C", resolution_url="fixture://gamma",
+            declared_station="EGLC", declared_precision=1,
+            resolved_at=datetime(2026, 7, 11, tzinfo=UTC),
+            collected_at=datetime(2026, 7, 11, 2, tzinfo=UTC), source={},
+        )
+        assert reconcile_resolution(conn, discrepancy) == "discrepancy"
+
+    monkeypatch.setattr(
+        ops, "promotion_gates",
+        lambda candidate, control: {
+            "reconciliation": candidate["reconciliation_checks_pass"] is True
+        },
+    )
+    with pytest.raises(ValueError, match="reconciliation"):
+        ops.promote_model("fresh-evidence", db_path=db_path)
+    with get_db(db_path) as conn:
+        assert conn.execute(
+            "SELECT status FROM model_versions WHERE id=?", ("fresh-evidence",)
+        ).fetchone()[0] == "shadow"
+
+
+
+def test_promotion_persists_complete_route_transition_report(db_path, monkeypatch):
+    import src.calibration_ops as ops
+
+    with get_db(db_path) as conn:
+        _insert_route_model(conn, "report-candidate", "capture_cutoff", "24_48h", "shadow")
+    fresh_metrics = {"fresh": True, "gamma": {"brier": .1}}
+    monkeypatch.setattr(ops, "evaluate_model", lambda *args, **kwargs: fresh_metrics)
+    monkeypatch.setattr(ops, "promotion_gates", lambda candidate, control: {"fresh": candidate["fresh"]})
+
+    assert ops.promote_model("report-candidate", db_path=db_path) == {"fresh": True}
+    with get_db(db_path) as conn:
+        legacy = conn.execute(
+            "SELECT status FROM model_versions WHERE id=?", ("legacy-emos-2026-04-08",)
+        ).fetchone()[0]
+        promoted = conn.execute(
+            "SELECT status FROM model_versions WHERE id=?", ("report-candidate",)
+        ).fetchone()[0]
+        report = json.loads(conn.execute(
+            "SELECT gate_report_json FROM model_transitions WHERE to_model_id=?",
+            ("report-candidate",),
+        ).fetchone()[0])
+    assert legacy == "active" and promoted == "active"
+    assert report["route"] == {"lead_basis": "capture_cutoff", "lead_bucket": "24_48h"}
+    assert report["candidate_id"] == "report-candidate"
+    assert report["control_id"] == "legacy-emos-2026-04-08"
+    assert report["candidate_metrics"] == fresh_metrics
+    assert report["gates"] == {"fresh": True}
+    assert parse_utc(report["evaluated_at"])

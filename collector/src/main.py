@@ -41,7 +41,8 @@ from .telegram import notify_trade_opened
 from .trading import TradingClient
 from .calibration_cli import add_calibration_commands, dispatch_calibration_command
 from .calibration_ops import (
-    persist_pipeline_forecasts, persist_market_quotes, unresolved_target_dates,
+    apply_routed_probabilities, persist_pipeline_forecasts, persist_market_quotes,
+    selected_model_versions, unresolved_target_dates,
 )
 
 logging.basicConfig(
@@ -147,6 +148,7 @@ async def scan_and_trade(
     forecasts = await fetch_all_ensembles(client, active_cities)
     forecast_snapshot_ids = persist_pipeline_forecasts(forecasts)
     await persist_market_quotes(client, markets, forecasts, forecast_snapshot_ids)
+    route_models = selected_model_versions(forecast_snapshot_ids)
 
     # Detect forecast shifts (latency exploitation)
     if latency_detector:
@@ -176,6 +178,7 @@ async def scan_and_trade(
         fc = city_fc.get(market.target_date)
         if not fc:
             continue
+        selected_model_id = route_models[(market.city, market.target_date)]
 
         # Probability estimation priority:
         # 1. BMA weighted (if BMA weights trained for this city)
@@ -190,6 +193,7 @@ async def scan_and_trade(
             mp = estimate_calibrated_probabilities(market, fc, city_emos)
         else:
             mp = estimate_bracket_probabilities(market, fc)
+        mp = apply_routed_probabilities(mp, selected_model_id)
 
         for bp in mp.brackets:
             # Record signal for Brier tracking
@@ -208,6 +212,7 @@ async def scan_and_trade(
                 # Paper trade (always — for tracking)
                 tid = record_paper_trade(
                     market.city, market.target_date, ps, market.total_volume,
+                    model_version_id=selected_model_id,
                 )
                 if tid is not None:
                     trade_ids.append(tid)

@@ -41,7 +41,11 @@ def add_calibration_commands(sub: argparse._SubParsersAction) -> None:
     parser.add_argument("--date", default=None, help="Optional target date (YYYY-MM-DD)")
 
     parser = sub.add_parser("train-candidate", help="Create an immutable, non-active model candidate")
-    parser.add_argument("--lead-bucket", choices=LEAD_BUCKETS, default=None)
+    parser.add_argument("--lead-bucket", choices=LEAD_BUCKETS, required=True)
+    parser.add_argument(
+        "--lead-basis", choices=("capture_cutoff", "run_time"),
+        default="capture_cutoff",
+    )
 
     parser = sub.add_parser("evaluate", help="Evaluate a model version chronologically")
     parser.add_argument("model_version")
@@ -75,7 +79,7 @@ def dispatch_calibration_command(args: argparse.Namespace) -> bool:
         target = date.fromisoformat(args.date) if args.date else None
         print(json.dumps(reconcile_all(target), indent=2, sort_keys=True))
     elif args.command == "train-candidate":
-        print(train_candidate(args.lead_bucket))
+        print(train_candidate(args.lead_bucket, lead_basis=args.lead_basis))
     elif args.command == "evaluate":
         print(json.dumps(evaluate_model(args.model_version), indent=2, sort_keys=True))
     elif args.command == "promote":
