@@ -1,20 +1,9 @@
-"""
-Historical data collection for EMOS training.
+"""Legacy historical reporting compatibility.
 
-Collects (ensemble_mean, ensemble_std, observed_max) triples by:
-1. Fetching historical ensemble forecasts from Open-Meteo's
-   "Previous Model Runs" / Historical Forecast API
-2. Fetching observed daily max temperatures from Open-Meteo Historical Weather API
-3. Pairing them by city/date and storing in SQLite
-
-Open-Meteo's historical forecast API provides past model runs —
-this is exactly what we need to evaluate how the ensemble performed
-historically without look-ahead bias.
-
-Usage:
-    python -m src.history collect --city nyc --days 90
-    python -m src.history train --city nyc
-    python -m src.history train --all
+The historical tables and command surface are retained for audit reports only.
+Their forecast issue times and station truth provenance are not sufficient for
+automatic calibration, so all rows are quarantined. New collection and training
+live in :mod:`src.calibration_ops` and the calibration ledger.
 """
 from __future__ import annotations
 
@@ -58,6 +47,8 @@ CREATE TABLE IF NOT EXISTS historical_forecasts (
     ens_min_c REAL NOT NULL,
     ens_max_c REAL NOT NULL,
     n_members INTEGER NOT NULL,
+    quality_status TEXT NOT NULL DEFAULT 'legacy_unverified',
+    training_eligible INTEGER NOT NULL DEFAULT 0,
     fetched_at TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE(city, target_date, lead_days, model)
 );
@@ -164,85 +155,26 @@ async def fetch_historical_ensemble(
     model: str = "ecmwf_ifs025_ensemble",
     db_path: Path | None = None,
 ) -> int:
+    """Deprecated unsafe collector retained only for API compatibility.
+
+    Historical Forecast responses do not prove a fixed model issue time and a
+    deterministic response is not an ensemble. Use
+    ``calibration_ops.collect_previous_run_summaries`` for verifiable,
+    explicitly untrainable fixed-lead summaries, or prospective Ensemble API
+    snapshots for member-level calibration data.
     """
-    Fetch historical ensemble forecasts from Open-Meteo.
-    
-    Uses the historical forecast API which provides past model runs.
-    This avoids look-ahead bias — we get what the ensemble actually
-    predicted at the time, not a reanalysis.
-    
-    Note: Open-Meteo's historical forecast endpoint stores daily
-    aggregates (temperature_2m_max) with member-level resolution
-    going back ~3 months for ensemble models.
-    """
-    city = config.CITIES.get(city_slug)
-    if not city:
+    del client, start_date, end_date
+    if city_slug not in config.CITIES:
         raise ValueError(f"Unknown city: {city_slug}")
-
-    # Historical forecast API endpoint
-    url = (
-        f"https://historical-forecast-api.open-meteo.com/v1/forecast"
-        f"?latitude={city.lat}&longitude={city.lon}"
-        f"&daily=temperature_2m_max"
-        f"&models={model}"
-        f"&temperature_unit=celsius"
-        f"&timezone={city.timezone}"
-        f"&start_date={start_date.isoformat()}"
-        f"&end_date={end_date.isoformat()}"
-    )
-
-    try:
-        resp = await client.get(url, timeout=60)
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        log.error(f"Historical forecast fetch failed for {city.name}/{model}: {e}")
-        return 0
-
-    data = resp.json()
-
-    # The historical forecast API returns deterministic daily values
-    # (it doesn't return individual members for historical runs).
-    # We'll use it as a proxy: the single forecast value as "mean"
-    # and estimate std from the spread of recent runs.
-    #
-    # For proper EMOS training with member-level data, we'd need the
-    # ensemble API's historical runs — but those only go back ~5 days.
-    # So we use the deterministic historical forecast as a training signal.
-    daily = data.get("daily", {})
-    times = daily.get("time", [])
-    temps = daily.get("temperature_2m_max", [])
-
-    if not times:
-        log.warning(f"No historical forecasts for {city.name}/{model}")
-        return 0
-
-    count = 0
     with get_db(db_path) as conn:
         conn.executescript(_HISTORY_SCHEMA)
-        for i, date_str in enumerate(times):
-            if i >= len(temps) or temps[i] is None:
-                continue
-            temp = float(temps[i])
-            # For historical deterministic forecasts, we approximate:
-            # mean = forecast value, std = climatological estimate (~2°C)
-            # This gets refined as we collect more ensemble-level data
-            try:
-                conn.execute(
-                    """
-                    INSERT OR IGNORE INTO historical_forecasts
-                        (city, target_date, lead_days, model,
-                         ens_mean_c, ens_std_c, ens_min_c, ens_max_c, n_members)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (city_slug, date_str, 1, model,
-                     temp, 2.0, temp - 3.0, temp + 3.0, 1),
-                )
-                count += 1
-            except Exception:
-                pass
-
-    log.info(f"Stored {count} historical forecasts for {city.name}/{model}")
-    return count
+    log.warning(
+        "Skipping legacy Historical Forecast collector for %s/%s; "
+        "unverified issue times and deterministic values are not trainable",
+        city_slug,
+        model,
+    )
+    return 0
 
 
 async def fetch_historical_ensemble_members(
@@ -252,85 +184,16 @@ async def fetch_historical_ensemble_members(
     end_date: date,
     db_path: Path | None = None,
 ) -> int:
-    """
-    Fetch actual ensemble member-level data for recent dates.
-    
-    Uses the standard ensemble API with past_days to get recent
-    historical forecasts with full member resolution. This is the
-    highest-quality training data but only covers ~10 days back.
-    """
-    city = config.CITIES.get(city_slug)
-    if not city:
+    """Deprecated look-back member fetch; prospective snapshots replace it."""
+    del client, start_date, end_date, db_path
+    if city_slug not in config.CITIES:
         raise ValueError(f"Unknown city: {city_slug}")
-
-    count = 0
-    for model in config.ENSEMBLE_MODELS:
-        url = (
-            f"{config.ENSEMBLE_API_BASE}"
-            f"?latitude={city.lat}&longitude={city.lon}"
-            f"&daily=temperature_2m_max"
-            f"&models={model}"
-            f"&temperature_unit=celsius"
-            f"&timezone={city.timezone}"
-            f"&past_days=10"
-            f"&forecast_days=1"
-        )
-
-        try:
-            resp = await client.get(url, timeout=config.HTTP_TIMEOUT)
-            resp.raise_for_status()
-        except httpx.HTTPError as e:
-            log.warning(f"Ensemble history fetch failed for {city.name}/{model}: {e}")
-            continue
-
-        data = resp.json()
-        daily = data.get("daily", {})
-        times = daily.get("time", [])
-
-        # Find member keys
-        member_keys = sorted([
-            k for k in daily.keys()
-            if k.startswith("temperature_2m_max_member")
-        ])
-
-        if not member_keys or not times:
-            continue
-
-        with get_db(db_path) as conn:
-            conn.executescript(_HISTORY_SCHEMA)
-            for date_idx, date_str in enumerate(times):
-                # Collect all member values for this date
-                member_vals = []
-                for mk in member_keys:
-                    vals = daily.get(mk, [])
-                    if date_idx < len(vals) and vals[date_idx] is not None:
-                        member_vals.append(float(vals[date_idx]))
-
-                if len(member_vals) < 5:
-                    continue
-
-                arr = np.array(member_vals)
-                try:
-                    conn.execute(
-                        """
-                        INSERT OR REPLACE INTO historical_forecasts
-                            (city, target_date, lead_days, model,
-                             ens_mean_c, ens_std_c, ens_min_c, ens_max_c, n_members)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (city_slug, date_str, 1, model,
-                         round(float(np.mean(arr)), 4),
-                         round(float(np.std(arr, ddof=1)), 4),
-                         round(float(np.min(arr)), 4),
-                         round(float(np.max(arr)), 4),
-                         len(member_vals)),
-                    )
-                    count += 1
-                except Exception:
-                    pass
-
-    log.info(f"Stored {count} ensemble-member forecasts for {city.name}")
-    return count
+    log.warning(
+        "Skipping look-back member fetch for %s; members first seen after their "
+        "target cutoff cannot be used for calibration",
+        city_slug,
+    )
+    return 0
 
 
 # ---------------------------------------------------------------------------
@@ -371,6 +234,8 @@ def build_training_data(
             JOIN historical_observations o
                 ON f.city = o.city AND f.target_date = o.target_date
             WHERE f.city = ?
+              AND COALESCE(f.quality_status, 'legacy_unverified') = 'ok'
+              AND COALESCE(f.training_eligible, 0) = 1
             GROUP BY f.target_date
             ORDER BY f.target_date
             """,
