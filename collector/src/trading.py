@@ -168,7 +168,7 @@ class TradingClient:
         except ImportError:
             log.warning(
                 "py-clob-client not installed. "
-                "Install with: pip install py-clob-client. "
+                "Run 'uv sync --locked' in collector/. "
                 "Falling back to dry-run mode."
             )
             self._live = False
@@ -330,8 +330,8 @@ class TradingClient:
             from web3 import Web3
         except ImportError:
             log.warning(
-                "web3 not installed — cannot redeem on-chain. "
-                "Install with: pip install web3"
+                "web3 is not part of the locked environment — "
+                "cannot redeem on-chain."
             )
             return False
 

@@ -8,10 +8,12 @@ A weather prediction market trading agent for [Polymarket](https://polymarket.co
 
 Polymarket lists daily "Highest temperature in [City]?" markets with 7-11 brackets (e.g., "72°F - 74°F"). Each bracket trades as a binary contract (YES/NO) on a CLOB order book.
 
-Wethr fetches 109-member ensemble weather forecasts from four models (ECMWF, GEFS, ICON, GEM) via Open-Meteo's free API, estimates the probability of each bracket, and trades when the ensemble disagrees with the market by ≥8%.
+Wethr fetches a multi-model ensemble from Open-Meteo, estimates the probability
+of each bracket from the members actually returned, and trades when the ensemble
+disagrees with the market by ≥8%.
 
 ```
-Ensemble (109 members)  →  Probability per bracket  →  Edge = P(model) - P(market)
+Available ensemble members  →  Probability per bracket  →  Edge = P(model) - P(market)
                          ↓                            ↓
                     EMOS calibration              Kelly sizing (5% fractional)
                     BMA model weighting           Hard caps ($100/trade, 5% bankroll)
@@ -40,33 +42,30 @@ src/
 ## Quick start
 
 ```bash
-cd collector   # from the repo root
+# From the repo root, sync the locked environment and run the complete gate
+./scripts/check
 
-# Create venv and install deps
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-
-# Or use the setup script (does all of the above + runs tests):
-# ./setup.sh
+cd collector
 
 # 1. Run diagnostics first — validates each API
-python run.py diagnose
+uv run python run.py diagnose
 
 # 2. Inspect the calibration ledger (new candidates need prospective history)
-python run.py collect-status
+uv run python run.py collect-status
 
 # 3. One-shot scan to see current edges
-python run.py scan
+uv run python run.py scan
 
-# 4. Start paper trading loop (scans every 5min, auto-settles daily)
-python run.py loop
+# 4. Start paper trading loop (scans every 10 minutes by default)
+uv run python run.py loop
 
 # 5. Check results
-python run.py report
+uv run python run.py report
 ```
 
-Note: `run.py` auto-detects the `.venv` directory and re-execs with the venv Python, so `python3 run.py scan` works even if you forgot to activate.
+`collector/setup.sh` remains a compatibility alias for `../scripts/check`.
+Neither command initializes the operational database. `run.py` still
+auto-detects the uv-managed `.venv` for direct application commands.
 
 ## CLI reference
 
@@ -74,7 +73,7 @@ Note: `run.py` auto-detects the `.venv` directory and re-execs with the venv Pyt
 |---------|-------------|
 | `python run.py scan [--cities nyc london]` | Discover markets, find edges |
 | `python run.py trade [--cities nyc]` | Scan + place paper trades |
-| `python run.py loop [--interval 300]` | Continuous scan/trade/settle loop |
+| `python run.py loop [--interval 600]` | Continuous scan/trade/settle loop |
 | `python run.py settle [YYYY-MM-DD]` | Settle trades (defaults to yesterday) |
 | `python run.py report` | Performance report with Brier score |
 | `python run.py pending` | Show open trades |
@@ -91,7 +90,8 @@ Note: `run.py` auto-detects the `.venv` directory and re-execs with the venv Pyt
 ```
 P(bracket) = members_in_bracket / total_members
 ```
-With 109 pooled members, resolution is ~0.9% per count.
+Probability resolution is `1 / total_members`, so it follows the model
+configuration and the members available in each response.
 
 **Phase 2 — EMOS calibration** (`calibration.py`)
 Fits N(μ, σ²) where μ = a + b·mean, σ = c + d·std. Trained by minimizing CRPS on historical data. Corrects ensemble under-dispersion (the #1 source of error in raw counting — tail brackets get underpriced).
@@ -132,7 +132,7 @@ All settings in `src/config.py`, overridable via `WETHR_` environment variables:
 | `WETHR_MAX_BANK_PCT` | 0.05 | Max % of bankroll per trade |
 | `WETHR_BANKROLL` | 10000.0 | Starting paper bankroll |
 | `WETHR_DAILY_LOSS` | 300.0 | Daily loss circuit breaker |
-| `WETHR_SCAN_INTERVAL` | 300 | Seconds between scans |
+| `WETHR_SCAN_INTERVAL` | 600 | Seconds between scans (10 minutes) |
 | `WETHR_LIVE` | 0 | Set to 1 for live trading |
 | `WETHR_TELEGRAM_BOT_TOKEN` | unset | Telegram bot token for new-position alerts |
 | `WETHR_TELEGRAM_CHAT_ID` | unset | Telegram chat ID for new-position alerts |
@@ -177,7 +177,7 @@ Pre-live checklist:
 
 | Source | Data | Auth |
 |--------|------|------|
-| Open-Meteo Ensemble API | 109-member multi-model ensemble forecasts | None |
+| Open-Meteo Ensemble API | Multi-model ensemble forecasts; available member count varies | None |
 | Open-Meteo Previous Runs | Verifiable fixed-lead deterministic audit summaries | None |
 | NWS + AviationWeather | Open official station observations | None |
 | Open-Meteo ERA5 | Secondary gridded audit only | None |
@@ -188,7 +188,7 @@ Pre-live checklist:
 ## Tests
 
 ```bash
-python tests/test_core.py  # 56 tests, no network required
+./scripts/check  # from the repository root
 ```
 
 Covers: bracket parsing, ensemble counting, CRPS math, EMOS training, BMA weighting, Kelly criterion, settlement logic, signal/trade dedup, trading client dry-run, latency detection, agent message routing.

@@ -8,7 +8,8 @@ Why ensemble counting works for weather betting:
 - Each ensemble member is a plausible future weather state
 - The fraction of members exceeding a threshold IS a probability estimate
 - More members = better probability resolution
-- Pooling models (143 total) gives better coverage than any single model
+- Pooling the members returned by available models gives broader coverage than
+  any single model; the total varies with configuration and API availability
 
 Limitations addressed in later phases:
 - Ensembles are under-dispersed (too narrow) -> EMOS/NGR calibration (Phase 3)

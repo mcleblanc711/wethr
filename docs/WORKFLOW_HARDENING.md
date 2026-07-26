@@ -1,10 +1,10 @@
 # Wethr Workflow Hardening
 
-Status: Phase 0 audit and implementation blueprint. The checks described as
-proposed below are **not implemented yet**.
+Status: Phase 0 audit retained; the P0-03 reproducible quality scaffold is
+implemented.
 
 Last verified: 2026-07-26
-Repository baseline: `72dc12e`
+Implementation baseline: `f243c08`
 
 ## Governing principles
 
@@ -16,93 +16,68 @@ Repository baseline: `72dc12e`
 - Local agent permissions reduce prompts and blast radius but are not a sandbox.
 - Every new check must be demonstrated against deliberately failing input.
 
-## Phase 0 findings
+## Phase 0 findings and P0-03 disposition
 
 ### Language and package/test tooling
 
-- Application language: Python.
-- Verified local interpreter: Python 3.12.3.
-- Package manager: `pip` with `collector/requirements.txt`.
-- Dependency lock: none.
-- Installed test runner: pytest 9.0.3.
-- pytest is not declared in the tracked requirements.
-- `uv 0.11.28` is installed on the host but is not configured for this project.
-- No tracked Ruff, Black, isort, mypy, pyright, tox, pre-commit, or formatter
-  configuration exists.
+- Application language: Python 3.12 (`>=3.12,<3.13`).
+- `collector/pyproject.toml` and `collector/uv.lock` are the only dependency
+  source; `collector/requirements.txt` was removed.
+- uv `0.11.32` is required, and `collector/.python-version` selects Python 3.12.
+- The uv project is non-packaged and includes pytest plus pytest-socket in its
+  development dependency group.
+- No Ruff, Black, isort, mypy, pyright, tox, pre-commit, or formatter gate was
+  added in this packet.
 
-### There is no canonical gate
+### Canonical gate (implemented by P0-03)
 
-The README documents a partial standalone runner:
-
-```text
-$ .venv/bin/python tests/test_core.py
-==================================================
-  63 passed, 0 failed, 63 total
-==================================================
-```
-
-The README calls this “56 tests,” and it does not include
-`test_calibration_ledger.py`.
-
-The installed pytest executable does not work as an interchangeable entrypoint:
+The public local and CI entrypoint is:
 
 ```text
-$ .venv/bin/pytest -q
-ERROR collecting tests/test_calibration_ledger.py
-ModuleNotFoundError: No module named 'src'
+./scripts/check [--base <git-ref>]
 ```
 
-The module form used by the merged calibration PR succeeds:
+The command requires uv `0.11.32`, Git, Docker Compose, and `systemd-analyze`.
+It synchronizes the locked development environment; runs the full pytest suite
+through `python -m pytest` with network sockets disabled (Unix-domain sockets are
+allowed for the asyncio event loop); compiles `collector/src`
+and `collector/scripts`; and validates every tracked workflow JSON, Compose file,
+and systemd service/timer discovered through Git. An expected empty file class is
+an error.
 
-```text
-$ .venv/bin/python -m pytest -q
-106 passed in 71.87s (0:01:11)
-```
+The Python checks run with `WETHR_LIVE=0`, `WETHR_DATA_DIR`, and `WETHR_DB_PATH`
+pointing to a temporary directory. Dependency downloads are allowed during
+`uv sync --locked`; Wethr runtime APIs and production databases are not.
 
-Additional ad hoc checks succeeded:
+The diff base precedence is explicit `--base`, `WETHR_DIFF_BASE`, `origin/main`,
+then local `main`. An explicit or environment-supplied nonzero ref must resolve.
+The command resolves the merge base and checks committed branch changes, then
+checks staged and unstaged changes separately with `git diff --check`.
 
-```text
-$ .venv/bin/python -m compileall -q src scripts
-(exit 0, no output)
-
-$ <parse n8n-wethr/workflows/*.json>
-3 workflow JSON files parsed
-
-$ systemd-analyze verify <all seven tracked units>
-(exit 0, no output)
-
-$ docker compose -f n8n-wethr/docker-compose.yml config -q
-(exit 0, no output)
-
-$ git diff --check
-(exit 0, no output)
-```
-
-These commands are not assembled into one tracked command or CI job.
-
-`collector/setup.sh` is not a safe substitute:
-
-- it installs unconstrained dependency versions;
-- it initializes the canonical default database before testing;
-- it runs only `tests/test_core.py`;
-- it then claims setup is complete.
+`collector/setup.sh` is a compatibility wrapper that requires uv and delegates
+to this command. It no longer installs through pip, initializes a database,
+performs partial imports, or invokes the legacy standalone test runner.
 
 ### CI and protected-branch state
 
 GitHub repository: `mcleblanc711/wethr`
 Default branch: `main`
 
-Verified GitHub state:
+P0-03 adds `.github/workflows/quality.yml` with one stable `quality` job for pull
+requests, pushes to `main`, and manual dispatch. It checks out full history at the
+PR head or push SHA, installs pinned uv and Python versions, and invokes only
+`./scripts/check` as its repository command.
 
-- zero Actions workflows;
-- no classic branch protection;
-- no repository rulesets;
-- no required status checks;
-- `main` reports `protected: false`;
-- required contexts and checks are empty;
-- `allow_update_branch` is false.
+At the last GitHub-settings audit:
 
-No GitHub setting was changed during this audit.
+- no classic branch protection existed;
+- no repository rulesets existed;
+- no status check was required;
+- `main` reported `protected: false`;
+- required contexts and checks were empty;
+- `allow_update_branch` was false.
+
+No GitHub setting is changed by P0-03. A workflow file is not branch protection.
 
 ### Observed naming
 
@@ -131,7 +106,8 @@ These resources can be affected invisibly by a branch or agent command:
 - n8n workflow IDs imported into one runtime
 - safety-critical environment flags such as `WETHR_LIVE`
 
-There is no versioned migration-number registry or dependency lockfile.
+There is still no versioned migration-number registry. P0-03 adds the dependency
+lockfile; ordered migrations remain P0-04.
 
 Tests use temporary fixture databases and did not reveal a globally claimed
 fixture-ID registry.
@@ -145,20 +121,21 @@ They are the repository's version-controlled workflow representation, so they
 should remain tracked. JSON validity belongs in the gate; runtime/export parity is
 a later n8n lifecycle concern.
 
-### Factual claims that have drifted
+### Factual claims corrected in P0-03
 
-- `collector/README.md` says 56 tests; the standalone file has 63 and the full
-  suite has 106.
-- `collector/README.md` describes a 300-second scan default; code defaults to 600.
-- `collector/src/config.py` labels 600 seconds as “5 min.”
-- README material describes 109 ensemble members while source/tests also assert
-  143; the currently configured non-GFS models total 109.
-- `setup.sh` implies complete test/module verification but runs only the legacy
-  standalone suite and imports a subset of modules.
-- Operations documentation describes daily/monthly behavior whose direct-script
-  systemd entrypoints were observed failing with `ModuleNotFoundError: src`.
-- `systemd-analyze verify` checks unit syntax; it does not prove the invoked Python
-  job can start safely.
+- Test documentation now names the full canonical gate without embedding a test
+  count that will drift as the suite changes.
+- The documented scan default and source comment now agree on 600 seconds
+  (10 minutes); runtime behavior is unchanged.
+- Ensemble documentation now derives probability resolution from the members
+  actually returned instead of promising one fixed pooled count.
+- `collector/setup.sh` now states and performs only its compatibility role; it
+  does not initialize an operational database or claim partial checks are complete.
+
+Two audit caveats remain outside P0-03: daily/monthly direct-script systemd
+entrypoints were observed failing with `ModuleNotFoundError: src`, and
+`systemd-analyze verify` checks unit syntax rather than proving that an invoked
+service can start safely.
 
 ## Applicability of the hardening brief
 
@@ -202,10 +179,10 @@ The future check must enforce:
 
 ### Item 4 — Tooling verifies its claims
 
-Decision: apply in the first workflow implementation packet.
+Decision: implemented by P0-03.
 
-Create one canonical gate and make `setup.sh` invoke it or remove the setup
-script's verification claim. Update stale test/count/timing statements.
+The canonical gate, safe `setup.sh` delegation, locked dependencies, and corrected
+test/count/timing statements are now present.
 
 There is no PR-body or report generator today, so the zero-byte-on-failure and
 `--no-verify` behavior has no current generator to attach to. Apply that contract
@@ -276,42 +253,42 @@ volume, services, and databases. If concurrency is adopted later, worktree
 lifecycle tooling must refuse unsafe retirement and read claims from the fetched
 remote default branch.
 
-## Proposed enforcement scaffold
+## Enforcement scaffold
 
-This section describes a target structure, not files that already exist.
+P0-03 implements the reproducible quality scaffold. Coordination documents still
+describe intent; the files below perform the checks.
 
 ### Coordination surfaces
 
 - `docs/REMEDIATION_BLUEPRINT.md`
 - `docs/WORKFLOW_HARDENING.md`
-- a packet/issue template containing defect, evidence, scope, non-goals, safety,
-  failure cases, gate, and model routing
-- short `AGENTS.md`/`CLAUDE.md` instructions that point to the canonical command
 
-Every coordination file should label itself as non-enforcement.
+A packet/issue template and short `AGENTS.md`/`CLAUDE.md` pointers remain later
+coordination work. They are not enforcement surfaces.
 
-### Enforcement surfaces
+### P0-03 enforcement surfaces
 
-- `collector/pyproject.toml`
-- `collector/uv.lock`
-- one repository-level gate command, tentatively `scripts/check`
-- `.github/workflows/quality.yml`
-- later, a pure migration classifier/check with table-driven tests
-- later, strict protected-branch settings
+- `collector/.python-version`, `collector/pyproject.toml`, and
+  `collector/uv.lock`
+- executable repository command `./scripts/check`
+- compatibility wrapper `collector/setup.sh`
+- `.github/workflows/quality.yml` with the stable job name `quality`
 
-### Smallest useful quality job
+A migration classifier and strict protected-branch settings remain later work.
 
-The first quality job should:
+### Quality job
+
+The local command and CI job:
 
 1. install the locked Python 3.12 environment;
-2. run the full suite through `python -m pytest`, never the ambiguous executable
-   form;
+2. run the full suite through `python -m pytest` with network sockets disabled;
 3. compile `collector/src` and `collector/scripts`;
 4. parse every tracked n8n workflow JSON file;
-5. validate Docker Compose configuration;
-6. validate all tracked systemd units;
-7. run an effective whitespace/diff check over the PR range;
-8. avoid the production databases and all network APIs.
+5. validate every tracked Compose file;
+6. validate every tracked systemd service and timer;
+7. check committed branch, staged, and unstaged whitespace; and
+8. isolate Python data paths from the production databases without starting any
+   application, service, timer, or container.
 
 Lint, format, and type enforcement are deliberately excluded from this MVP. No
 baseline exists, and adopting all three would force unrelated source churn.
