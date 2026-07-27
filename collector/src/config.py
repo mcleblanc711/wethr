@@ -188,7 +188,7 @@ MAX_PENDING_TRADES = int(os.getenv("WETHR_MAX_PENDING", "20"))
 # ---------------------------------------------------------------------------
 # Scan Intervals
 # ---------------------------------------------------------------------------
-SCAN_INTERVAL_SECONDS = int(os.getenv("WETHR_SCAN_INTERVAL", "600"))  # 5 min
+SCAN_INTERVAL_SECONDS = int(os.getenv("WETHR_SCAN_INTERVAL", "600"))  # 10 min
 
 # ---------------------------------------------------------------------------
 # Ensemble confidence threshold

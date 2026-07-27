@@ -139,6 +139,10 @@ entrypoint. Direct-script import behavior cannot differ from package execution.
 Outcome: one documented command runs the same locked environment and checks
 locally and in CI. See [WORKFLOW_HARDENING.md](WORKFLOW_HARDENING.md).
 
+Status: the P0-03 source scaffold is implemented by `./scripts/check`, the
+`collector/uv.lock`, and the `quality` workflow. Making `quality` required remains a
+separate protected-branch activation step after the workflow reaches `main`.
+
 ### 04. Versioned migrations
 
 Outcome: ordered migration files replace inline schema evolution. Already-merged

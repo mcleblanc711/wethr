@@ -29,23 +29,32 @@ The two halves talk via the shared SQLite database in `data/wethr.db`:
 ## Quick start
 
 ```bash
+# Reproduce the complete local quality gate (requires uv 0.11.32, Git,
+# Docker Compose, and systemd-analyze)
+./scripts/check
+
 # Trading agent
 cd collector
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-python run.py diagnose
-python run.py doctor
+uv sync --locked
+uv run python run.py diagnose
+uv run python run.py doctor
 
 # Divergence audit (separate terminal)
-cd n8n-wethr
+cd ../n8n-wethr
 docker compose up -d
 # open http://localhost:5678
 ```
 
-`python run.py export-settled` writes `n8n-wethr/wethr-output/settled_trades.json`,
-the file consumed by the audit workflow. `python run.py doctor` reports the DB
-path, recent table activity, export status, and any legacy `collector/data`
-database still present.
+`./scripts/check` is the command used by CI. It installs only the locked
+development environment, disables network socket access during pytest, and
+directs all
+Python gate data to a temporary directory. It does not start the collector,
+containers, services, or timers.
+
+`uv run python run.py export-settled` writes
+`n8n-wethr/wethr-output/settled_trades.json`, the file consumed by the audit
+workflow. `uv run python run.py doctor` reports the DB path, recent table
+activity, export status, and any legacy `collector/data` database still present.
 
 ## License
 

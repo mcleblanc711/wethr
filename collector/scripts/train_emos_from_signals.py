@@ -4,9 +4,9 @@ Train EMOS using settled signals that have ensemble_mean, ensemble_std,
 and resolved_value populated.
 
 This supplements the history.py pipeline by using the signals table as a
-training data source. Signals have real ensemble statistics from the live
-multi-model ensemble (109+ members), not the fake std=2.0 approximation
-from the deterministic historical forecast API.
+training data source. Signals have real statistics from the live multi-model
+ensemble, whose member count varies, rather than the synthetic spread used by
+the deterministic historical forecast API.
 
 Supports city grouping to pool samples across similar cities when
 per-city data is too sparse for reliable EMOS coefficients.

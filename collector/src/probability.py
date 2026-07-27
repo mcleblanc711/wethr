@@ -4,9 +4,9 @@ Probability estimation from ensemble forecasts.
 Phase 1: Raw ensemble counting
     P(bracket) = (# members with daily max in bracket) / (total members)
 
-This is the simplest unbiased estimator. It works because each ensemble
-member is an equally likely future state. With 143 pooled members,
-resolution is ~0.7% per count.
+This is the simplest raw estimator. Each member contributes one count, so
+resolution is 1 / total_members and varies with the configured models and the
+members available in the response.
 
 Known limitations (addressed in later phases):
     - Ensembles are under-dispersed → tail probabilities are underestimated

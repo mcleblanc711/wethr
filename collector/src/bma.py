@@ -1,8 +1,8 @@
 """
 Bayesian Model Averaging (BMA) — Phase 4.
 
-Instead of pooling all 143 ensemble members with equal weight,
-BMA weights each model by its historical forecasting skill.
+Instead of pooling every available ensemble member with equal weight, BMA
+weights each model by its historical forecasting skill.
 
 Why this matters:
 - ECMWF IFS is consistently the best global ensemble for 1-7 day temperature
