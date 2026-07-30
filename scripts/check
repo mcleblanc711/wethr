@@ -2,9 +2,9 @@
 set -euo pipefail
 
 readonly REQUIRED_UV_VERSION="0.11.32"
-readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-readonly REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-readonly COLLECTOR_DIR="$REPO_ROOT/collector"
+readonly REQUIRED_PYTHON_VERSION="3.12.13"
+readonly REQUIRED_COMPOSE_VERSION="2.40.3"
+readonly REQUIRED_SYSTEMD_MAJOR="255"
 
 die() {
     printf 'check: error: %s\n' "$*" >&2
@@ -19,174 +19,352 @@ require_command() {
         die "required command '$command_name' was not found; $install_hint"
 }
 
-explicit_base=""
-while (($# > 0)); do
-    case "$1" in
-        --base)
-            (($# >= 2)) || die "--base requires a Git reference"
-            [[ -n "$2" ]] || die "--base requires a non-empty Git reference"
-            explicit_base="$2"
-            shift 2
+is_zero_sha() {
+    local value="${1:-}"
+    [[ -n "$value" && "$value" =~ ^0+$ ]]
+}
+
+is_workflow_json_file() {
+    local path="${1:-}"
+    local basename="${path##*/}"
+    [[ "$path" == n8n-wethr/workflows/*.json && "$basename" != ".json" ]]
+}
+
+is_systemd_unit_file() {
+    local path="${1:-}"
+    local basename="${path##*/}"
+    if [[ "$path" == deploy/systemd/*.service && "$basename" != ".service" ]]; then
+        return 0
+    fi
+    [[ "$path" == deploy/systemd/*.timer && "$basename" != ".timer" ]]
+}
+
+is_quality_workflow_file() {
+    [[ "${1:-}" == ".github/workflows/quality.yml" ]]
+}
+
+is_compose_file() {
+    local path="${1:-}"
+    local basename="${path##*/}"
+
+    case "$basename" in
+        compose.yml|compose.yaml|docker-compose.yml|docker-compose.yaml)
+            return 0
             ;;
         *)
-            die "unknown argument '$1'; usage: ./scripts/check [--base <git-ref>]"
+            return 1
             ;;
     esac
-done
-
-require_command uv "install uv $REQUIRED_UV_VERSION from https://docs.astral.sh/uv/"
-require_command git "install Git and retry"
-require_command docker "install Docker with the Compose plugin and retry"
-require_command systemd-analyze "install systemd tooling and retry"
-
-uv_version="$(uv --version 2>/dev/null || true)"
-[[ "$uv_version" == "uv $REQUIRED_UV_VERSION"* ]] ||
-    die "uv $REQUIRED_UV_VERSION is required, but found '${uv_version:-an unusable uv command}'"
-
-docker compose version >/dev/null 2>&1 ||
-    die "'docker compose' is unavailable; install the Docker Compose plugin and retry"
-systemd-analyze --version >/dev/null 2>&1 ||
-    die "'systemd-analyze' is unavailable or unusable; install systemd tooling and retry"
-
-resolved_root="$(git -C "$REPO_ROOT" rev-parse --show-toplevel 2>/dev/null)" ||
-    die "'$REPO_ROOT' is not inside a Git worktree"
-[[ "$resolved_root" == "$REPO_ROOT" ]] ||
-    die "script resolved '$REPO_ROOT', but Git resolved '$resolved_root'"
-
-base_ref=""
-base_commit=""
-if [[ -n "$explicit_base" ]]; then
-    base_ref="$explicit_base"
-    base_commit="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "${base_ref}^{commit}")" ||
-        die "explicit diff base '$base_ref' does not resolve to a commit"
-elif [[ -n "${WETHR_DIFF_BASE:-}" && ! "${WETHR_DIFF_BASE}" =~ ^0+$ ]]; then
-    base_ref="$WETHR_DIFF_BASE"
-    base_commit="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "${base_ref}^{commit}")" ||
-        die "WETHR_DIFF_BASE '$base_ref' does not resolve to a commit"
-else
-    for candidate in origin/main main; do
-        if candidate_commit="$(git -C "$REPO_ROOT" rev-parse --verify --quiet "${candidate}^{commit}")"; then
-            base_ref="$candidate"
-            base_commit="$candidate_commit"
-            break
-        fi
-    done
-    [[ -n "$base_commit" ]] ||
-        die "no diff base resolves; pass --base, set WETHR_DIFF_BASE, or fetch origin/main"
-fi
-
-head_commit="$(git -C "$REPO_ROOT" rev-parse --verify HEAD)"
-merge_base="$(git -C "$REPO_ROOT" merge-base "$base_commit" "$head_commit")" ||
-    die "diff base '$base_ref' and HEAD have no merge base"
-
-workflow_files=()
-while IFS= read -r file; do
-    [[ -n "$file" ]] && workflow_files+=("$file")
-done < <(git -C "$REPO_ROOT" ls-files 'n8n-wethr/workflows/*.json')
-(( ${#workflow_files[@]} > 0 )) ||
-    die "no tracked n8n workflow JSON files found under n8n-wethr/workflows/"
-
-unit_files=()
-while IFS= read -r file; do
-    [[ -n "$file" ]] && unit_files+=("$file")
-done < <(git -C "$REPO_ROOT" ls-files 'deploy/systemd/*.service' 'deploy/systemd/*.timer')
-(( ${#unit_files[@]} > 0 )) ||
-    die "no tracked systemd service or timer units found under deploy/systemd/"
-
-compose_files=()
-while IFS= read -r file; do
-    case "$file" in
-        compose.yml|compose.yaml|docker-compose.yml|docker-compose.yaml|*/compose.yml|*/compose.yaml|*/docker-compose.yml|*/docker-compose.yaml)
-            compose_files+=("$file")
-            ;;
-    esac
-done < <(git -C "$REPO_ROOT" ls-files)
-(( ${#compose_files[@]} > 0 )) ||
-    die "no tracked Compose files found"
-
-check_tmp="$(mktemp -d "${TMPDIR:-/tmp}/wethr-check.XXXXXX")"
-cleanup() {
-    rm -rf -- "$check_tmp"
 }
-trap cleanup EXIT
 
-export WETHR_LIVE=0
-export WETHR_DATA_DIR="$check_tmp/data"
-export WETHR_DB_PATH="$WETHR_DATA_DIR/wethr.db"
-export PYTHONPYCACHEPREFIX="$check_tmp/pycache"
-mkdir -p "$WETHR_DATA_DIR"
+rewrite_unit_line() {
+    local line="$1"
+    local repo_root="$2"
 
-printf 'check: syncing locked Python environment with uv %s\n' "$REQUIRED_UV_VERSION"
-(
-    cd "$COLLECTOR_DIR"
-    uv sync --locked
-)
+    printf '%s\n' "${line//%h\/projects\/wethr/$repo_root}"
+}
 
-printf 'check: running pytest with network socket access disabled\n'
-(
-    cd "$COLLECTOR_DIR"
-    uv run python -m pytest -q --disable-socket --allow-unix-socket -p no:cacheprovider
-)
+extract_uv_version() {
+    local output="${1:-}"
 
-printf 'check: compiling collector/src and collector/scripts\n'
-(
-    cd "$COLLECTOR_DIR"
-    uv run python -m compileall -q src scripts
-)
+    [[ "$output" =~ ^uv[[:space:]]+([^[:space:]]+) ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
 
-printf 'check: parsing %d tracked n8n workflow JSON file(s)\n' "${#workflow_files[@]}"
-for file in "${workflow_files[@]}"; do
+extract_compose_version() {
+    local output="${1:-}"
+
+    [[ "$output" =~ ^Docker[[:space:]]+Compose[[:space:]]+version[[:space:]]+v?([0-9]+\.[0-9]+\.[0-9]+)([^0-9.]|$) ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+extract_systemd_major() {
+    local output="${1:-}"
+
+    [[ "$output" =~ ^systemd[[:space:]]+([0-9]+)([[:space:]]|$) ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+sanitize_wethr_environment() {
+    local variable_name=""
+
+    while IFS= read -r variable_name; do
+        [[ -n "$variable_name" ]] && unset "$variable_name"
+    done < <(compgen -e WETHR_ || true)
+}
+
+main() {
+    local script_dir=""
+    local repo_root=""
+    local collector_dir=""
+    script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" ||
+        die "cannot resolve the directory containing scripts/check"
+    repo_root="$(cd "$script_dir/.." && pwd)" ||
+        die "cannot resolve the repository root"
+    collector_dir="$repo_root/collector"
+    readonly script_dir repo_root collector_dir
+
+    local explicit_base=""
+    while (($# > 0)); do
+        case "$1" in
+            --base)
+                (($# >= 2)) || die "--base requires a Git reference"
+                [[ -n "$2" ]] || die "--base requires a non-empty Git reference"
+                explicit_base="$2"
+                shift 2
+                ;;
+            *)
+                die "unknown argument '$1'; usage: ./scripts/check [--base <git-ref>]"
+                ;;
+        esac
+    done
+
+    require_command uv "install uv $REQUIRED_UV_VERSION from https://docs.astral.sh/uv/"
+    require_command git "install Git and retry"
+    require_command docker "install Docker with the Compose plugin and retry"
+    require_command systemd-analyze "install systemd tooling and retry"
+
+    local uv_output=""
+    local uv_version=""
+    uv_output="$(uv --version 2>/dev/null)" ||
+        die "'uv' is unavailable or unusable"
+    uv_version="$(extract_uv_version "$uv_output")" ||
+        die "cannot parse the uv version from '$uv_output'"
+    [[ "$uv_version" == "$REQUIRED_UV_VERSION" ]] ||
+        die "uv $REQUIRED_UV_VERSION is required, but found '$uv_version'"
+
+    local compose_output=""
+    local compose_version=""
+    compose_output="$(docker compose version 2>/dev/null)" ||
+        die "'docker compose' is unavailable; install the Docker Compose plugin and retry"
+    compose_version="$(extract_compose_version "$compose_output")" ||
+        die "cannot parse the Docker Compose version from '$compose_output'"
+    [[ "$compose_version" == "$REQUIRED_COMPOSE_VERSION" ]] ||
+        die "Docker Compose $REQUIRED_COMPOSE_VERSION is required, but found '$compose_version'"
+
+    local systemd_output=""
+    local systemd_major=""
+    systemd_output="$(systemd-analyze --version 2>/dev/null)" ||
+        die "'systemd-analyze' is unavailable or unusable; install systemd tooling and retry"
+    systemd_major="$(extract_systemd_major "$systemd_output")" ||
+        die "cannot parse the systemd version from '${systemd_output%%$'\n'*}'"
+    [[ "$systemd_major" == "$REQUIRED_SYSTEMD_MAJOR" ]] ||
+        die "systemd major $REQUIRED_SYSTEMD_MAJOR is required, but found '$systemd_major'"
+
+    local resolved_root=""
+    resolved_root="$(git -C "$repo_root" rev-parse --show-toplevel 2>/dev/null)" ||
+        die "'$repo_root' is not inside a Git worktree"
+    [[ "$resolved_root" == "$repo_root" ]] ||
+        die "script resolved '$repo_root', but Git resolved '$resolved_root'"
+
+    local base_ref=""
+    local base_commit=""
+    if [[ -n "$explicit_base" ]]; then
+        base_ref="$explicit_base"
+        base_commit="$(git -C "$repo_root" rev-parse --verify --quiet "${base_ref}^{commit}")" ||
+            die "explicit diff base '$base_ref' does not resolve to a commit"
+    elif [[ -n "${WETHR_DIFF_BASE:-}" ]] && ! is_zero_sha "$WETHR_DIFF_BASE"; then
+        base_ref="$WETHR_DIFF_BASE"
+        base_commit="$(git -C "$repo_root" rev-parse --verify --quiet "${base_ref}^{commit}")" ||
+            die "WETHR_DIFF_BASE '$base_ref' does not resolve to a commit"
+    else
+        local candidate=""
+        local candidate_commit=""
+        for candidate in origin/main main; do
+            if candidate_commit="$(git -C "$repo_root" rev-parse --verify --quiet "${candidate}^{commit}")"; then
+                base_ref="$candidate"
+                base_commit="$candidate_commit"
+                break
+            fi
+        done
+        [[ -n "$base_commit" ]] ||
+            die "no diff base resolves; pass --base, set WETHR_DIFF_BASE, or fetch origin/main"
+    fi
+
+    local head_commit=""
+    local merge_base=""
+    head_commit="$(git -C "$repo_root" rev-parse --verify HEAD)" ||
+        die "HEAD does not resolve to a commit"
+    merge_base="$(git -C "$repo_root" merge-base "$base_commit" "$head_commit")" ||
+        die "diff base '$base_ref' and HEAD have no merge base"
+
+    local check_tmp=""
+    check_tmp="$(mktemp -d "${TMPDIR:-/tmp}/wethr-check.XXXXXX")" ||
+        die "cannot create the temporary check directory"
+    cleanup() {
+        rm -rf -- "$check_tmp"
+    }
+    trap cleanup EXIT
+
+    local tracked_file_list="$check_tmp/tracked-files"
+    git -C "$repo_root" ls-files -z >"$tracked_file_list" ||
+        die "cannot enumerate tracked repository files"
+
+    local -a workflow_files=()
+    local -a unit_files=()
+    local -a compose_files=()
+    local quality_workflow_found=0
+    local file=""
+    while IFS= read -r -d '' file; do
+        if is_workflow_json_file "$file"; then
+            workflow_files+=("$file")
+        fi
+        if is_systemd_unit_file "$file"; then
+            unit_files+=("$file")
+        fi
+        if is_compose_file "$file"; then
+            compose_files+=("$file")
+        fi
+        if is_quality_workflow_file "$file"; then
+            quality_workflow_found=1
+        fi
+    done <"$tracked_file_list"
+
+    (( ${#workflow_files[@]} > 0 )) ||
+        die "no tracked n8n workflow JSON files found under n8n-wethr/workflows/"
+    (( ${#unit_files[@]} > 0 )) ||
+        die "no tracked systemd service or timer units found under deploy/systemd/"
+    (( ${#compose_files[@]} > 0 )) ||
+        die "no tracked Compose files found"
+    (( quality_workflow_found == 1 )) ||
+        die "required quality workflow '.github/workflows/quality.yml' is not tracked"
+
+    sanitize_wethr_environment
+    export WETHR_LIVE=0
+    export WETHR_DATA_DIR="$check_tmp/data"
+    export WETHR_DB_PATH="$WETHR_DATA_DIR/wethr.db"
+    export PYTHONPYCACHEPREFIX="$check_tmp/pycache"
+    mkdir -p "$WETHR_DATA_DIR"
+
+    printf 'check: syncing locked Python %s environment with uv %s\n' \
+        "$REQUIRED_PYTHON_VERSION" "$REQUIRED_UV_VERSION"
     (
-        cd "$COLLECTOR_DIR"
-        uv run python -m json.tool "$REPO_ROOT/$file" >/dev/null
-    ) || die "malformed workflow JSON: $file"
-done
+        cd "$collector_dir"
+        uv sync --locked --python "$REQUIRED_PYTHON_VERSION"
+    ) || die "locked Python environment synchronization failed"
 
-printf 'check: validating %d tracked Compose file(s)\n' "${#compose_files[@]}"
-for file in "${compose_files[@]}"; do
-    docker compose -f "$REPO_ROOT/$file" config -q ||
-        die "invalid Compose configuration: $file"
-done
+    local python_runtime=""
+    python_runtime="$(
+        cd "$collector_dir"
+        uv run --frozen --python "$REQUIRED_PYTHON_VERSION" \
+            python -c 'import platform; print(platform.python_version(), platform.python_implementation())'
+    )" || die "cannot inspect the synchronized Python runtime"
+    [[ "$python_runtime" == "$REQUIRED_PYTHON_VERSION CPython" ]] ||
+        die "CPython $REQUIRED_PYTHON_VERSION is required, but found '$python_runtime'"
 
-printf 'check: validating %d tracked systemd unit(s)\n' "${#unit_files[@]}"
-unit_verify_dir="$check_tmp/systemd"
-# The installed user units target %h/projects/wethr. Resolve only that checkout
-# prefix in temporary copies so the same syntax check works in local and CI
-# paths without mutating the tracked units.
-mkdir -p "$unit_verify_dir"
-unit_paths=()
-for file in "${unit_files[@]}"; do
-    unit_path="$unit_verify_dir/${file##*/}"
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        printf '%s\n' "${line//%h\/projects\/wethr/$REPO_ROOT}"
-    done <"$REPO_ROOT/$file" >"$unit_path"
-    unit_paths+=("$unit_path")
-done
-systemd_output="$check_tmp/systemd-analyze.log"
-if ! systemd-analyze verify --user "${unit_paths[@]}" >"$systemd_output" 2>&1; then
-    while IFS= read -r line; do
-        printf '%s\n' "$line" >&2
-    done <"$systemd_output"
-    die "systemd unit validation failed"
+    printf 'check: running pytest with network socket access disabled\n'
+    (
+        cd "$collector_dir"
+        uv run --frozen --python "$REQUIRED_PYTHON_VERSION" \
+            python -m pytest -q --disable-socket --allow-unix-socket -p no:cacheprovider
+    ) || die "pytest failed"
+
+    printf 'check: compiling collector/src and collector/scripts\n'
+    (
+        cd "$collector_dir"
+        uv run --frozen --python "$REQUIRED_PYTHON_VERSION" \
+            python -m compileall -q src scripts
+    ) || die "collector byte-compilation failed"
+
+    printf 'check: parsing %d tracked n8n workflow JSON file(s)\n' "${#workflow_files[@]}"
+    for file in "${workflow_files[@]}"; do
+        (
+            cd "$collector_dir"
+            uv run --frozen --python "$REQUIRED_PYTHON_VERSION" \
+                python -m json.tool "$repo_root/$file" >/dev/null
+        ) || die "malformed workflow JSON: $file"
+    done
+
+    printf 'check: validating %d tracked Compose file(s)\n' "${#compose_files[@]}"
+    for file in "${compose_files[@]}"; do
+        docker compose -f "$repo_root/$file" config -q ||
+            die "invalid Compose configuration: $file"
+    done
+
+    printf 'check: validating %d tracked systemd unit(s)\n' "${#unit_files[@]}"
+    local unit_verify_dir="$check_tmp/systemd"
+    # The installed user units target %h/projects/wethr. Resolve only that checkout
+    # prefix in temporary copies so the same syntax check works in local and CI
+    # paths without mutating the tracked units. Preserve relative directories so
+    # units with identical basenames cannot overwrite one another.
+    mkdir -p "$unit_verify_dir"
+    local -a unit_paths=()
+    local unit_path=""
+    local line=""
+    for file in "${unit_files[@]}"; do
+        unit_path="$unit_verify_dir/$file"
+        mkdir -p "${unit_path%/*}"
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            rewrite_unit_line "$line" "$repo_root"
+        done <"$repo_root/$file" >"$unit_path"
+        unit_paths+=("$unit_path")
+    done
+
+    local systemd_verify_output="$check_tmp/systemd-analyze.log"
+    if ! systemd-analyze verify --user "${unit_paths[@]}" >"$systemd_verify_output" 2>&1; then
+        while IFS= read -r line; do
+            printf '%s\n' "$line" >&2
+        done <"$systemd_verify_output"
+        die "systemd unit validation failed"
+    fi
+    if [[ -s "$systemd_verify_output" ]]; then
+        while IFS= read -r line; do
+            printf '%s\n' "$line" >&2
+        done <"$systemd_verify_output"
+        die "systemd unit validation reported diagnostics"
+    fi
+
+    printf "check: checking committed whitespace from merge base %s (%s)\n" \
+        "${merge_base:0:12}" "$base_ref"
+    git -C "$repo_root" diff --check "$merge_base" "$head_commit" ||
+        die "whitespace errors found in committed branch changes"
+
+    printf 'check: checking staged whitespace\n'
+    git -C "$repo_root" diff --cached --check ||
+        die "whitespace errors found in staged changes"
+
+    printf 'check: checking unstaged whitespace\n'
+    git -C "$repo_root" diff --check ||
+        die "whitespace errors found in unstaged changes"
+
+    printf 'check: checking untracked whitespace\n'
+    local untracked_file_list="$check_tmp/untracked-files"
+    git -C "$repo_root" ls-files --others --exclude-standard -z >"$untracked_file_list" ||
+        die "cannot enumerate untracked repository files"
+
+    local untracked_index=0
+    local untracked_status=0
+    local untracked_output=""
+    local untracked_has_errors=0
+    while IFS= read -r -d '' file; do
+        ((untracked_index += 1))
+        untracked_output="$check_tmp/untracked-$untracked_index.log"
+        if git diff --no-index --check -- /dev/null "$repo_root/$file" \
+            >"$untracked_output" 2>&1; then
+            untracked_status=0
+        else
+            untracked_status=$?
+        fi
+        # --no-index returns 1 for a clean difference and sets the --check error
+        # bit as well (observed status 3) for whitespace diagnostics. Git usage
+        # and inspection failures use higher statuses.
+        (( untracked_status <= 3 )) ||
+            die "cannot inspect untracked file for whitespace errors: $file"
+        if [[ -s "$untracked_output" ]]; then
+            while IFS= read -r line; do
+                printf '%s\n' "$line" >&2
+            done <"$untracked_output"
+            untracked_has_errors=1
+        fi
+    done <"$untracked_file_list"
+    (( untracked_has_errors == 0 )) ||
+        die "whitespace errors found in untracked files"
+
+    printf 'check: all checks passed\n'
+    cleanup
+    trap - EXIT
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
 fi
-if [[ -s "$systemd_output" ]]; then
-    while IFS= read -r line; do
-        printf '%s\n' "$line" >&2
-    done <"$systemd_output"
-    die "systemd unit validation reported diagnostics"
-fi
-
-printf "check: checking committed whitespace from merge base %s (%s)\n" \
-    "${merge_base:0:12}" "$base_ref"
-git -C "$REPO_ROOT" diff --check "$merge_base" "$head_commit" ||
-    die "whitespace errors found in committed branch changes"
-
-printf 'check: checking staged whitespace\n'
-git -C "$REPO_ROOT" diff --cached --check ||
-    die "whitespace errors found in staged changes"
-
-printf 'check: checking unstaged whitespace\n'
-git -C "$REPO_ROOT" diff --check ||
-    die "whitespace errors found in unstaged changes"
-
-printf 'check: all checks passed\n'
