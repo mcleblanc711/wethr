@@ -1,10 +1,10 @@
 # Wethr Workflow Hardening
 
-Status: Phase 0 audit retained; the P0-03 reproducible quality scaffold is
-implemented.
+Status: Phase 0 audit retained; the P0-03 reproducible quality scaffold and its
+independent-review follow-up are implemented.
 
-Last verified: 2026-07-26
-Implementation baseline: `f243c08`
+Last verified: 2026-07-30
+P0-03 merge baseline: `539bd5b`
 
 ## Governing principles
 
@@ -23,7 +23,9 @@ Implementation baseline: `f243c08`
 - Application language: Python 3.12 (`>=3.12,<3.13`).
 - `collector/pyproject.toml` and `collector/uv.lock` are the only dependency
   source; `collector/requirements.txt` was removed.
-- uv `0.11.32` is required, and `collector/.python-version` selects Python 3.12.
+- The gate requires uv `0.11.32` and CPython `3.12.13` exactly;
+  `collector/.python-version` selects that interpreter while the application
+  compatibility range remains `>=3.12,<3.13`.
 - The uv project is non-packaged and includes pytest plus pytest-socket in its
   development dependency group.
 - No Ruff, Black, isort, mypy, pyright, tox, pre-commit, or formatter gate was
@@ -37,22 +39,36 @@ The public local and CI entrypoint is:
 ./scripts/check [--base <git-ref>]
 ```
 
-The command requires uv `0.11.32`, Git, Docker Compose, and `systemd-analyze`.
-It synchronizes the locked development environment; runs the full pytest suite
-through `python -m pytest` with network sockets disabled (Unix-domain sockets are
-allowed for the asyncio event loop); compiles `collector/src`
-and `collector/scripts`; and validates every tracked workflow JSON, Compose file,
-and systemd service/timer discovered through Git. An expected empty file class is
-an error.
+The command requires uv `0.11.32`, CPython `3.12.13`, Docker Compose `2.40.3`,
+Git, and systemd major `255`. uv, Compose, and systemd are asserted before
+expensive checks, and the synchronized Python runtime is asserted before tests.
+Compose packaging suffixes are allowed only after the exact `2.40.3` core
+version. The gate synchronizes the locked runtime and development environment;
+runs the full pytest suite through `python -m pytest` with network sockets
+disabled (Unix-domain sockets are allowed for the asyncio event loop); compiles
+`collector/src` and `collector/scripts`; and validates every tracked workflow
+JSON, Compose file, and systemd service/timer discovered through Git. All
+`uv run` calls use `--frozen`.
 
-The Python checks run with `WETHR_LIVE=0`, `WETHR_DATA_DIR`, and `WETHR_DB_PATH`
-pointing to a temporary directory. Dependency downloads are allowed during
-`uv sync --locked`; Wethr runtime APIs and production databases are not.
+Tracked paths are classified by pure, table-tested functions over a NUL-delimited
+`git ls-files` stream. Compose files are recognized by one of the four standard
+basenames at any depth; n8n JSON and systemd units must remain beneath their
+documented roots. The quality workflow itself must remain tracked. An expected
+empty file class is an error. Temporary systemd copies preserve their repository
+relative paths before the documented `%h/projects/wethr` checkout prefix is
+rewritten, so duplicate basenames cannot collide.
+
+After the diff base is resolved, every inherited `WETHR_*` environment variable
+is removed. The Python checks receive only `WETHR_LIVE=0`, `WETHR_DATA_DIR`, and
+`WETHR_DB_PATH`, with both paths pointing to a temporary directory. Dependency
+and interpreter downloads are allowed during `uv sync --locked`; Wethr runtime
+APIs and production databases are not.
 
 The diff base precedence is explicit `--base`, `WETHR_DIFF_BASE`, `origin/main`,
 then local `main`. An explicit or environment-supplied nonzero ref must resolve.
 The command resolves the merge base and checks committed branch changes, then
-checks staged and unstaged changes separately with `git diff --check`.
+checks staged, unstaged, and ignored-excluded untracked files separately for
+whitespace errors.
 
 `collector/setup.sh` is a compatibility wrapper that requires uv and delegates
 to this command. It no longer installs through pip, initializes a database,
@@ -64,8 +80,11 @@ GitHub repository: `mcleblanc711/wethr`
 Default branch: `main`
 
 P0-03 adds `.github/workflows/quality.yml` with one stable `quality` job for pull
-requests, pushes to `main`, and manual dispatch. It checks out full history at the
-PR head or push SHA, installs pinned uv and Python versions, and invokes only
+requests, pushes to `main`, and manual dispatch. Pull requests use GitHub's merge
+ref so the candidate is checked with the current base; pushes use the pushed
+commit. Checkout retains full history without persisted Git credentials. CI
+installs the pinned uv, Python, and Compose versions, supplies
+`WETHR_DIFF_BASE` only from the pull-request base SHA, and invokes only
 `./scripts/check` as its repository command.
 
 At the last GitHub-settings audit:
@@ -280,15 +299,60 @@ A migration classifier and strict protected-branch settings remain later work.
 
 The local command and CI job:
 
-1. install the locked Python 3.12 environment;
-2. run the full suite through `python -m pytest` with network sockets disabled;
-3. compile `collector/src` and `collector/scripts`;
-4. parse every tracked n8n workflow JSON file;
-5. validate every tracked Compose file;
-6. validate every tracked systemd service and timer;
-7. check committed branch, staged, and unstaged whitespace; and
-8. isolate Python data paths from the production databases without starting any
+1. assert uv `0.11.32`, CPython `3.12.13`, Compose `2.40.3`, and systemd `255`;
+2. install the locked Python runtime and development environment;
+3. run the full suite through `python -m pytest` with network sockets disabled;
+4. compile `collector/src` and `collector/scripts`;
+5. parse every tracked n8n workflow JSON file;
+6. validate every tracked Compose file;
+7. validate every tracked systemd service and timer;
+8. check committed branch, staged, unstaged, and untracked whitespace; and
+9. isolate Python data paths from the production databases without starting any
    application, service, timer, or container.
+
+### Deliberate failure demonstrations
+
+The offline fixture suite runs the production `scripts/check` against temporary
+Git repositories and deterministic tool shims. The verified command was:
+
+```text
+cd collector
+uv run --frozen --python 3.12.13 python -m pytest -q tests/test_quality_gate.py -p no:cacheprovider
+60 passed in 3.40s
+```
+
+Each row below is a real parameterized fixture case. It asserts a nonzero exit
+and the recorded terminal error marker.
+
+| Gate class | Deliberately failing input | Terminal error marker |
+|---|---|---|
+| Tool versions | uv `0.11.320`; Compose `2.40.30`; systemd `258` | required version/major not found |
+| Locked sync | shimmed `uv sync` failure | `locked Python environment synchronization failed` |
+| Python runtime | shimmed CPython `3.12.12` | `CPython 3.12.13 is required` |
+| Pytest | shimmed test failure | `pytest failed` |
+| Compilation | shimmed compile failure | `collector byte-compilation failed` |
+| Workflow JSON | malformed tracked JSON | `malformed workflow JSON` |
+| Compose | rejected tracked configuration | `invalid Compose configuration` |
+| systemd | nonzero verify and exit-zero diagnostic | `systemd unit validation failed/reported diagnostics` |
+| Required file classes | remove JSON, Compose, all units, or quality workflow | class-specific `not found`/`not tracked` error |
+| Diff selection | bad argument or unresolved explicit base | actionable argument/base error |
+| Whitespace | committed, staged, unstaged, or untracked trailing space | scope-specific whitespace error |
+
+The complete gate was then run with hostile inherited sizing, Telegram, diff-base,
+and unknown future `WETHR_*` values. The fixture separately proved that child
+Python processes received only the three gate-owned variables. Real output:
+
+```text
+166 passed in 65.04s (0:01:05)
+check: parsing 3 tracked n8n workflow JSON file(s)
+check: validating 1 tracked Compose file(s)
+check: validating 7 tracked systemd unit(s)
+check: checking committed whitespace from merge base 539bd5b25ead (origin/main)
+check: checking staged whitespace
+check: checking unstaged whitespace
+check: checking untracked whitespace
+check: all checks passed
+```
 
 Lint, format, and type enforcement are deliberately excluded from this MVP. No
 baseline exists, and adopting all three would force unrelated source churn.

@@ -29,8 +29,8 @@ The two halves talk via the shared SQLite database in `data/wethr.db`:
 ## Quick start
 
 ```bash
-# Reproduce the complete local quality gate (requires uv 0.11.32, Git,
-# Docker Compose, and systemd-analyze)
+# Reproduce the complete local quality gate (requires uv 0.11.32,
+# CPython 3.12.13, Docker Compose 2.40.3, Git, and systemd 255)
 ./scripts/check
 
 # Trading agent
@@ -45,11 +45,10 @@ docker compose up -d
 # open http://localhost:5678
 ```
 
-`./scripts/check` is the command used by CI. It installs only the locked
-development environment, disables network socket access during pytest, and
-directs all
-Python gate data to a temporary directory. It does not start the collector,
-containers, services, or timers.
+`./scripts/check` is the command used by CI. It synchronizes the locked runtime
+and development dependencies, disables network socket access during pytest, and
+directs all Python gate data to a temporary directory. It does not start the
+collector, containers, services, or timers.
 
 `uv run python run.py export-settled` writes
 `n8n-wethr/wethr-output/settled_trades.json`, the file consumed by the audit
