@@ -24,16 +24,21 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
         with:
           fetch-depth: 0
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install uv and Python
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b
         with:
           version: "0.11.32"
-          python-version: "3.12"
+          python-version: "3.12.13"
           enable-cache: true
+
+      - name: Install Docker Compose
+        uses: docker/setup-compose-action@4eb059ff7f16592f9c84d5ca339c53cb7c5064e2
+        with:
+          version: v2.40.3
 
       - name: Run quality gate
         env:
-          WETHR_DIFF_BASE: ${{ github.event.pull_request.base.sha || github.event.before || '' }}
+          WETHR_DIFF_BASE: ${{ github.event.pull_request.base.sha || '' }}
         run: ./scripts/check
