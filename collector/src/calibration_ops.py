@@ -19,7 +19,7 @@ import numpy as np
 
 from . import config
 from .calibration import EMOSParams, TrainingData, crps_gaussian, train_emos
-from .ensemble import _fetch_batch_model
+from .ensemble import RateLimited, _fetch_batch_model
 from .ledger import (
     ForecastSnapshotInput,
     LEGACY_MODEL_VERSION,
@@ -95,7 +95,16 @@ async def collect_prospective_forecasts(
     seen = utc_now()
     inserted = unchanged = failed = 0
     for model in config.ENSEMBLE_MODELS:
-        batches = await _fetch_batch_model(client, slugs, model)
+        try:
+            batches = await _fetch_batch_model(client, slugs, model)
+        except RateLimited as exc:
+            failed += len(slugs)
+            log.warning(
+                "Prospective forecast capture stopped after rate limiting; "
+                "daily truth and resolution collection will continue: %s",
+                exc,
+            )
+            break
         with get_db(db_path) as conn:
             for city, by_date in batches.items():
                 for target, members in by_date.items():
