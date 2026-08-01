@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
 from datetime import date, datetime, timedelta, timezone
 
@@ -31,6 +32,35 @@ def test_lead_bucket_boundaries():
     assert [lead_bucket(v) for v in (-.01, 0, 23.9, 24, 48, 72)] == [
         "in_day", "0_24h", "0_24h", "24_48h", "48_72h", "72h_plus"
     ]
+
+
+@pytest.mark.parametrize(
+    ("service", "module"),
+    [
+        ("wethr-calibration-daily.service", "scripts.daily_calibration"),
+        ("wethr-calibration-monthly.service", "scripts.monthly_calibration"),
+    ],
+)
+def test_calibration_services_use_importable_module_entrypoints(service, module):
+    importlib.import_module(module)
+    unit = (config.REPO_ROOT / "deploy" / "systemd" / service).read_text()
+    assert f"/.venv/bin/python -m {module}" in unit
+
+
+def test_prospective_rate_limit_is_reported_without_aborting_daily_collection(
+    monkeypatch,
+):
+    from src import calibration_ops
+    from src.ensemble import RateLimited
+
+    async def rate_limited(*_args, **_kwargs):
+        raise RateLimited("fixture")
+
+    monkeypatch.setattr(calibration_ops, "_fetch_batch_model", rate_limited)
+    result = asyncio.run(
+        calibration_ops.collect_prospective_forecasts(object(), ["london"])
+    )
+    assert result == {"inserted": 0, "unchanged": 0, "failed": 1}
 
 
 def test_forecast_hash_dedup_and_content_versions(db_path):
