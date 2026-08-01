@@ -15,6 +15,7 @@ dependencies = [
 dev = [
     "pytest>=9.0.3",
     "pytest-socket>=0.7.0",
+    "pyyaml>=6.0.3",
 ]
 
 [tool.uv]

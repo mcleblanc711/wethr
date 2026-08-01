@@ -42,10 +42,15 @@ The public local and CI entrypoint is:
 The command requires uv `0.11.32`, CPython `3.12.13`, Docker Compose `2.40.3`,
 Git, and systemd major `255`. uv, Compose, and systemd are asserted before
 expensive checks, and the synchronized Python runtime is asserted before tests.
+The uv, Python, and Compose versions are exact; systemd is a major-version
+compatibility boundary because local hosts and GitHub-hosted runners supply the
+installed `255.x` package. Any `systemd-analyze verify` diagnostic remains a
+fail-closed error, so a point-release behavior change cannot pass silently.
 Compose packaging suffixes are allowed only after the exact `2.40.3` core
-version. The gate synchronizes the locked runtime and development environment;
-runs the full pytest suite through `python -m pytest` with network sockets
-disabled (Unix-domain sockets are allowed for the asyncio event loop); compiles
+version, and Compose diagnostics fail even when `config -q` exits zero. The gate
+synchronizes the locked runtime and development environment; runs the full
+pytest suite through `python -m pytest` with network sockets disabled
+(Unix-domain sockets are allowed for the asyncio event loop); compiles
 `collector/src` and `collector/scripts`; and validates every tracked workflow
 JSON, Compose file, and systemd service/timer discovered through Git. All
 `uv run` calls use `--frozen`.
@@ -58,17 +63,29 @@ empty file class is an error. Temporary systemd copies preserve their repository
 relative paths before the documented `%h/projects/wethr` checkout prefix is
 rewritten, so duplicate basenames cannot collide.
 
-After the diff base is resolved, every inherited `WETHR_*` environment variable
-is removed. The Python checks receive only `WETHR_LIVE=0`, `WETHR_DATA_DIR`, and
-`WETHR_DB_PATH`, with both paths pointing to a temporary directory. Dependency
-and interpreter downloads are allowed during `uv sync --locked`; Wethr runtime
-APIs and production databases are not.
+After the diff base is resolved, every shell-addressable inherited `WETHR_*`
+environment variable is removed. The Python checks receive only
+`WETHR_LIVE=0`, `WETHR_DATA_DIR`, and `WETHR_DB_PATH`, with both paths pointing
+to a temporary directory. Host Python and uv selectors that can change imports,
+interpreter behavior, synchronization, or the project-environment location are
+also removed. The gate sets `PYTHONHASHSEED=0` and fixes
+`UV_PROJECT_ENVIRONMENT` at `collector/.venv`. Dependency and interpreter
+downloads are allowed during `uv sync --locked`; Wethr runtime APIs and
+production databases are not.
+
+The exact CPython pin governs gate subprocesses. It does not change the
+pre-existing `/usr/bin/python3` runtime used by the collector and export systemd
+services.
 
 The diff base precedence is explicit `--base`, `WETHR_DIFF_BASE`, `origin/main`,
 then local `main`. An explicit or environment-supplied nonzero ref must resolve.
 The command resolves the merge base and checks committed branch changes, then
 checks staged, unstaged, and ignored-excluded untracked files separately for
 whitespace errors.
+
+Push and manual-dispatch runs do not receive `WETHR_DIFF_BASE`. When
+`origin/main` already equals `HEAD`, their committed-change range is empty; the
+staged, unstaged, and untracked scopes still run.
 
 `collector/setup.sh` is a compatibility wrapper that requires uv and delegates
 to this command. It no longer installs through pip, initializes a database,
@@ -86,6 +103,17 @@ commit. Checkout retains full history without persisted Git credentials. CI
 installs the pinned uv, Python, and Compose versions, supplies
 `WETHR_DIFF_BASE` only from the pull-request base SHA, and invokes only
 `./scripts/check` as its repository command.
+
+The fixture suite parses the workflow as YAML and asserts the complete trigger,
+permission, runner, action-pin, input, environment, and step structure. Known-bad
+mutations cover a head-ref checkout, `github.sha` as the diff base, an additional
+shell step, write permissions, an unpinned checkout action, uv-version drift,
+and runner drift.
+
+CI inherits systemd from the `ubuntu-24.04` runner image and asserts major `255`;
+it does not install or pin an exact systemd package revision. Unit verification
+runs after `uv sync` because rewritten `ExecStart` paths require the synchronized
+`collector/.venv` interpreter to exist.
 
 At the last GitHub-settings audit:
 
@@ -299,13 +327,14 @@ A migration classifier and strict protected-branch settings remain later work.
 
 The local command and CI job:
 
-1. assert uv `0.11.32`, CPython `3.12.13`, Compose `2.40.3`, and systemd `255`;
+1. assert uv `0.11.32`, CPython `3.12.13`, Compose `2.40.3`, and systemd major `255`;
 2. install the locked Python runtime and development environment;
 3. run the full suite through `python -m pytest` with network sockets disabled;
 4. compile `collector/src` and `collector/scripts`;
 5. parse every tracked n8n workflow JSON file;
-6. validate every tracked Compose file;
-7. validate every tracked systemd service and timer;
+6. validate every tracked Compose file and reject diagnostics;
+7. validate every tracked systemd service and timer after the synchronized
+   interpreter exists;
 8. check committed branch, staged, unstaged, and untracked whitespace; and
 9. isolate Python data paths from the production databases without starting any
    application, service, timer, or container.
@@ -318,7 +347,7 @@ Git repositories and deterministic tool shims. The verified command was:
 ```text
 cd collector
 uv run --frozen --python 3.12.13 python -m pytest -q tests/test_quality_gate.py -p no:cacheprovider
-60 passed in 3.40s
+78 passed
 ```
 
 Each row below is a real parameterized fixture case. It asserts a nonzero exit
@@ -326,24 +355,27 @@ and the recorded terminal error marker.
 
 | Gate class | Deliberately failing input | Terminal error marker |
 |---|---|---|
-| Tool versions | uv `0.11.320`; Compose `2.40.30`; systemd `258` | required version/major not found |
+| Tool versions | wrong or unparseable uv, Compose, or systemd output | required version/major or parse error |
+| Required commands/worktree | missing command or non-worktree checkout | actionable prerequisite error |
 | Locked sync | shimmed `uv sync` failure | `locked Python environment synchronization failed` |
 | Python runtime | shimmed CPython `3.12.12` | `CPython 3.12.13 is required` |
 | Pytest | shimmed test failure | `pytest failed` |
 | Compilation | shimmed compile failure | `collector byte-compilation failed` |
 | Workflow JSON | malformed tracked JSON | `malformed workflow JSON` |
-| Compose | rejected tracked configuration | `invalid Compose configuration` |
+| Compose | rejected configuration or exit-zero diagnostic | `invalid Compose configuration`/`reported diagnostics` |
 | systemd | nonzero verify and exit-zero diagnostic | `systemd unit validation failed/reported diagnostics` |
 | Required file classes | remove JSON, Compose, all units, or quality workflow | class-specific `not found`/`not tracked` error |
-| Diff selection | bad argument or unresolved explicit base | actionable argument/base error |
-| Whitespace | committed, staged, unstaged, or untracked trailing space | scope-specific whitespace error |
+| Diff selection | bad argument; unresolved explicit/environment base; zero-SHA fallback | actionable error or successful `main` fallback |
+| Whitespace | committed, staged, unstaged, untracked, or unreadable untracked file | scope-specific whitespace/inspection error |
+| CI workflow | seven policy-breaking YAML mutations | structural contract assertion |
 
-The complete gate was then run with hostile inherited sizing, Telegram, diff-base,
-and unknown future `WETHR_*` values. The fixture separately proved that child
-Python processes received only the three gate-owned variables. Real output:
+The complete gate was then run with hostile inherited Wethr, Python, and uv
+selectors. The fixture separately proved that child Python processes received
+only the three gate-owned `WETHR_*` variables, a deterministic hash seed, and the
+repository-local uv environment path. Real output:
 
 ```text
-166 passed in 65.04s (0:01:05)
+184 passed
 check: parsing 3 tracked n8n workflow JSON file(s)
 check: validating 1 tracked Compose file(s)
 check: validating 7 tracked systemd unit(s)
