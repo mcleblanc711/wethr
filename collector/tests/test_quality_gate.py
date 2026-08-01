@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -524,7 +525,9 @@ def test_untracked_whitespace_uses_repository_configuration(
         ("staged-whitespace", "whitespace errors found in staged changes"),
         ("unstaged-whitespace", "whitespace errors found in unstaged changes"),
         ("untracked-whitespace", "whitespace errors found in untracked files"),
+        ("hostile-git-config", "whitespace errors found in untracked files"),
         ("untracked-inspection", "cannot inspect untracked file for whitespace errors"),
+        ("extra-workflow", "unexpected GitHub workflow file(s)"),
         ("missing-json", "no tracked n8n workflow JSON files found"),
         ("missing-compose", "no tracked Compose files found"),
         ("missing-units", "no tracked systemd service or timer units found"),
@@ -573,10 +576,29 @@ def test_gate_deliberate_failures(
         _write(gate_fixture.root / "README.md", "trailing space \n")
     elif scenario == "untracked-whitespace":
         _write(gate_fixture.root / "untracked.txt", "trailing space \n")
+    elif scenario == "hostile-git-config":
+        # Git honors whitespace policy from its own environment, so an inherited
+        # override must not reach the gate's Git invocations.
+        _write(gate_fixture.root / "untracked.txt", "trailing space \n")
+        environment.update(
+            {
+                "GIT_CONFIG_COUNT": "1",
+                "GIT_CONFIG_KEY_0": "core.whitespace",
+                "GIT_CONFIG_VALUE_0": "-trailing-space,-blank-at-eol",
+            }
+        )
     elif scenario == "untracked-inspection":
+        if os.geteuid() == 0:
+            pytest.skip("root bypasses the unreadable-file permission this case relies on")
         unreadable = gate_fixture.root / "unreadable.txt"
         _write(unreadable, "inspect me\n")
         unreadable.chmod(0)
+    elif scenario == "extra-workflow":
+        _write(
+            gate_fixture.root / ".github" / "workflows" / "probe.yml",
+            "name: probe\n",
+        )
+        gate_fixture.git("add", ".github/workflows/probe.yml")
     elif scenario == "missing-json":
         gate_fixture.git("rm", "-q", "n8n-wethr/workflows/audit.json")
     elif scenario == "missing-compose":
@@ -621,6 +643,44 @@ def test_gate_deliberate_failures(
 
 def test_quality_workflow_preserves_ci_contract() -> None:
     _assert_quality_workflow_contract(QUALITY_WORKFLOW.read_text(encoding="utf-8"))
+
+
+def test_gate_pins_match_the_ci_workflow() -> None:
+    """The same versions are declared in four places; keep them from drifting."""
+    workflow: dict[str, Any] = yaml.load(
+        QUALITY_WORKFLOW.read_text(encoding="utf-8"), Loader=yaml.BaseLoader
+    )
+    steps = {step["name"]: step for step in workflow["jobs"]["quality"]["steps"]}
+    uv_version = steps["Install uv and Python"]["with"]["version"]
+    python_version = steps["Install uv and Python"]["with"]["python-version"]
+    compose_version = steps["Install Docker Compose"]["with"]["version"].removeprefix("v")
+
+    check_source = CHECK_SCRIPT.read_text(encoding="utf-8")
+    assert f'readonly REQUIRED_UV_VERSION="{uv_version}"' in check_source
+    assert f'readonly REQUIRED_PYTHON_VERSION="{python_version}"' in check_source
+    assert f'readonly REQUIRED_COMPOSE_VERSION="{compose_version}"' in check_source
+
+    project = REPO_ROOT / "collector"
+    assert (project / ".python-version").read_text(encoding="utf-8").strip() == python_version
+    assert (
+        f'required-version = "=={uv_version}"'
+        in (project / "pyproject.toml").read_text(encoding="utf-8")
+    )
+
+
+def test_gate_allows_only_the_quality_github_workflow() -> None:
+    check_source = CHECK_SCRIPT.read_text(encoding="utf-8")
+    start = check_source.index("readonly ALLOWED_GITHUB_WORKFLOWS=(")
+    declaration = check_source[start : check_source.index(")", start)]
+    assert re.findall(r'"([^"]+)"', declaration) == [".github/workflows/quality.yml"]
+
+    tracked = subprocess.run(
+        ["git", "-C", str(REPO_ROOT), "ls-files", "-z", ".github/workflows"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split("\0")
+    assert [path for path in tracked if path] == [".github/workflows/quality.yml"]
 
 
 @pytest.mark.parametrize(

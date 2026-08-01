@@ -6,6 +6,13 @@ readonly REQUIRED_PYTHON_VERSION="3.12.13"
 readonly REQUIRED_COMPOSE_VERSION="2.40.3"
 readonly REQUIRED_SYSTEMD_MAJOR="255"
 
+# Every tracked file under .github/workflows/ must appear here. Adding a
+# workflow is then a deliberate, reviewable edit rather than a silent bypass of
+# the quality workflow's asserted contract.
+readonly ALLOWED_GITHUB_WORKFLOWS=(
+    ".github/workflows/quality.yml"
+)
+
 die() {
     printf 'check: error: %s\n' "$*" >&2
     exit 1
@@ -41,6 +48,20 @@ is_systemd_unit_file() {
 
 is_quality_workflow_file() {
     [[ "${1:-}" == ".github/workflows/quality.yml" ]]
+}
+
+is_github_workflow_path() {
+    [[ "${1:-}" == .github/workflows/* ]]
+}
+
+is_allowed_github_workflow() {
+    local path="${1:-}"
+    local allowed=""
+
+    for allowed in "${ALLOWED_GITHUB_WORKFLOWS[@]}"; do
+        [[ "$path" != "$allowed" ]] || return 0
+    done
+    return 1
 }
 
 is_compose_file() {
@@ -83,6 +104,34 @@ extract_systemd_major() {
 
     [[ "$output" =~ ^systemd[[:space:]]+([0-9]+)(\.[0-9]+)?([[:space:]]|$) ]] || return 1
     printf '%s\n' "${BASH_REMATCH[1]}"
+}
+
+sanitize_git_environment() {
+    local variable_name=""
+
+    # Git reads whitespace policy, config location, and repository location from
+    # its environment, so an inherited GIT_CONFIG_* or GIT_DIR can silently
+    # disable every whitespace scope or redirect enumeration to a foreign index.
+    # Removing GIT_CONFIG_COUNT is sufficient to drop GIT_CONFIG_KEY_<n> and
+    # GIT_CONFIG_VALUE_<n>, which Git only reads up to that count.
+    local -a inherited_git_environment=(
+        GIT_ALTERNATE_OBJECT_DIRECTORIES
+        GIT_ATTR_NOSYSTEM
+        GIT_CEILING_DIRECTORIES
+        GIT_COMMON_DIR
+        GIT_CONFIG
+        GIT_CONFIG_COUNT
+        GIT_CONFIG_GLOBAL
+        GIT_CONFIG_SYSTEM
+        GIT_DIR
+        GIT_INDEX_FILE
+        GIT_NAMESPACE
+        GIT_OBJECT_DIRECTORY
+        GIT_WORK_TREE
+    )
+    for variable_name in "${inherited_git_environment[@]}"; do
+        unset "$variable_name"
+    done
 }
 
 sanitize_gate_environment() {
@@ -147,6 +196,11 @@ main() {
     require_command git "install Git and retry"
     require_command docker "install Docker with the Compose plugin and retry"
     require_command systemd-analyze "install systemd tooling and retry"
+
+    # Unlike the Wethr and Python selectors below, this must precede every Git
+    # invocation: repository enumeration and the first whitespace scope would
+    # otherwise already have run under inherited configuration.
+    sanitize_git_environment
 
     local uv_output=""
     local uv_version=""
@@ -227,6 +281,7 @@ main() {
     local -a workflow_files=()
     local -a unit_files=()
     local -a compose_files=()
+    local -a unexpected_github_workflows=()
     local quality_workflow_found=0
     local file=""
     while IFS= read -r -d '' file; do
@@ -242,7 +297,13 @@ main() {
         if is_quality_workflow_file "$file"; then
             quality_workflow_found=1
         fi
+        if is_github_workflow_path "$file" && ! is_allowed_github_workflow "$file"; then
+            unexpected_github_workflows+=("$file")
+        fi
     done <"$tracked_file_list"
+
+    (( ${#unexpected_github_workflows[@]} == 0 )) ||
+        die "unexpected GitHub workflow file(s) not covered by the asserted CI contract: ${unexpected_github_workflows[*]}"
 
     (( ${#workflow_files[@]} > 0 )) ||
         die "no tracked n8n workflow JSON files found under n8n-wethr/workflows/"

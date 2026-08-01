@@ -3,7 +3,7 @@
 Status: Phase 0 audit retained; the P0-03 reproducible quality scaffold and its
 independent-review follow-up are implemented.
 
-Last verified: 2026-07-30
+Last verified: 2026-07-31
 P0-03 merge baseline: `539bd5b`
 
 ## Governing principles
@@ -58,10 +58,27 @@ JSON, Compose file, and systemd service/timer discovered through Git. All
 Tracked paths are classified by pure, table-tested functions over a NUL-delimited
 `git ls-files` stream. Compose files are recognized by one of the four standard
 basenames at any depth; n8n JSON and systemd units must remain beneath their
-documented roots. The quality workflow itself must remain tracked. An expected
-empty file class is an error. Temporary systemd copies preserve their repository
-relative paths before the documented `%h/projects/wethr` checkout prefix is
-rewritten, so duplicate basenames cannot collide.
+documented roots. The quality workflow itself must remain tracked, and it is the
+only tracked path permitted under `.github/workflows/`: every other file there
+fails the gate, because the asserted CI contract covers one workflow and an
+additional workflow would otherwise carry unreviewed triggers and permissions.
+Adding one is a deliberate edit to the `ALLOWED_GITHUB_WORKFLOWS` allowlist. An
+expected empty file class is an error. Temporary systemd copies preserve their
+repository relative paths before the documented `%h/projects/wethr` checkout
+prefix is rewritten, so duplicate basenames cannot collide.
+
+Before the first Git invocation, inherited Git selectors are removed:
+`GIT_CONFIG`, `GIT_CONFIG_COUNT`, `GIT_CONFIG_GLOBAL`, `GIT_CONFIG_SYSTEM`,
+`GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR`, `GIT_INDEX_FILE`,
+`GIT_OBJECT_DIRECTORY`, `GIT_ALTERNATE_OBJECT_DIRECTORIES`,
+`GIT_CEILING_DIRECTORIES`, `GIT_NAMESPACE`, and `GIT_ATTR_NOSYSTEM`. Git reads
+`core.whitespace` from its environment, so an inherited
+`GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_<n>`/`GIT_CONFIG_VALUE_<n>` triple or a
+hostile `GIT_CONFIG_GLOBAL` would otherwise silence every whitespace scope while
+the gate still reported success. Dropping `GIT_CONFIG_COUNT` is sufficient to
+drop the numbered key/value pairs, which Git reads only up to that count. This
+sanitization deliberately precedes repository enumeration and diff-base
+resolution, unlike the `WETHR_*` pass below.
 
 After the diff base is resolved, every shell-addressable inherited `WETHR_*`
 environment variable is removed. The Python checks receive only
@@ -108,7 +125,9 @@ The fixture suite parses the workflow as YAML and asserts the complete trigger,
 permission, runner, action-pin, input, environment, and step structure. Known-bad
 mutations cover a head-ref checkout, `github.sha` as the diff base, an additional
 shell step, write permissions, an unpinned checkout action, uv-version drift,
-and runner drift.
+and runner drift. That contract binds one file, so the gate separately rejects
+any other tracked path under `.github/workflows/`; otherwise a second workflow
+could reintroduce the same triggers and permissions the contract forbids.
 
 CI inherits systemd from the `ubuntu-24.04` runner image and asserts major `255`;
 it does not install or pin an exact systemd package revision. Unit verification
@@ -347,7 +366,7 @@ Git repositories and deterministic tool shims. The verified command was:
 ```text
 cd collector
 uv run --frozen --python 3.12.13 python -m pytest -q tests/test_quality_gate.py -p no:cacheprovider
-78 passed
+82 passed
 ```
 
 Each row below is a real parameterized fixture case. It asserts a nonzero exit
@@ -365,9 +384,17 @@ and the recorded terminal error marker.
 | Compose | rejected configuration or exit-zero diagnostic | `invalid Compose configuration`/`reported diagnostics` |
 | systemd | nonzero verify and exit-zero diagnostic | `systemd unit validation failed/reported diagnostics` |
 | Required file classes | remove JSON, Compose, all units, or quality workflow | class-specific `not found`/`not tracked` error |
+| Workflow allowlist | track a second `.github/workflows/` file | `unexpected GitHub workflow file(s)` |
 | Diff selection | bad argument; unresolved explicit/environment base; zero-SHA fallback | actionable error or successful `main` fallback |
 | Whitespace | committed, staged, unstaged, untracked, or unreadable untracked file | scope-specific whitespace/inspection error |
+| Inherited Git config | `GIT_CONFIG_COUNT` override disabling `core.whitespace` | `whitespace errors found in untracked files` |
 | CI workflow | seven policy-breaking YAML mutations | structural contract assertion |
+
+The unreadable-file case is skipped under `uid 0`, which bypasses the permission
+it relies on. Pin drift is covered separately: one test asserts that the uv,
+CPython, and Compose versions in `scripts/check` agree with the workflow inputs,
+`collector/.python-version`, and the `required-version` in
+`collector/pyproject.toml`.
 
 The complete gate was then run with hostile inherited Wethr, Python, and uv
 selectors. The fixture separately proved that child Python processes received
@@ -375,7 +402,7 @@ only the three gate-owned `WETHR_*` variables, a deterministic hash seed, and th
 repository-local uv environment path. Real output:
 
 ```text
-184 passed
+188 passed
 check: parsing 3 tracked n8n workflow JSON file(s)
 check: validating 1 tracked Compose file(s)
 check: validating 7 tracked systemd unit(s)
