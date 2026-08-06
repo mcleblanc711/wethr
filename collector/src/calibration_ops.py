@@ -19,6 +19,10 @@ import numpy as np
 
 from . import config
 from .calibration import EMOSParams, TrainingData, crps_gaussian, train_emos
+from .eligibility import (
+    exclusions_manifest,
+    overlapping_exclusions,
+)
 from .ensemble import RateLimited, _fetch_batch_model
 from .ledger import (
     ForecastSnapshotInput,
@@ -105,6 +109,14 @@ async def collect_prospective_forecasts(
                 exc,
             )
             break
+        except (httpx.HTTPError, ValueError, TypeError, KeyError, IndexError) as exc:
+            failed += len(slugs)
+            log.warning(
+                "Prospective %s payload failed; truth and resolution collection "
+                "will continue: %s: %s",
+                model, type(exc).__name__, exc,
+            )
+            continue
         with get_db(db_path) as conn:
             for city, by_date in batches.items():
                 for target, members in by_date.items():
@@ -165,8 +177,15 @@ async def collect_previous_run_summaries(
     }
     response = await client.get(PREVIOUS_RUNS_URL, params=params, timeout=60)
     response.raise_for_status()
-    hourly = response.json().get("hourly", {})
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("Previous Runs response must be a JSON object")
+    hourly = payload.get("hourly")
+    if not isinstance(hourly, dict):
+        raise ValueError("Previous Runs response lacks an hourly object")
     times = hourly.get("time", [])
+    if not isinstance(times, list):
+        raise ValueError("Previous Runs hourly.time must be a list")
     per_day: dict[tuple[date, int], list[float]] = defaultdict(list)
     for idx, time_text in enumerate(times):
         local_date = datetime.fromisoformat(time_text).date()
@@ -215,12 +234,25 @@ async def collect_nws_observations(
         timeout=config.HTTP_TIMEOUT,
     )
     response.raise_for_status()
+    payload = response.json()
+    if not isinstance(payload, dict):
+        raise ValueError("NWS observations response must be a JSON object")
+    features = payload.get("features")
+    if not isinstance(features, list):
+        raise ValueError("NWS observations response lacks a features list")
     inserted = 0
     received = utc_now()
     with get_db(db_path) as conn:
-        for feature in response.json().get("features", []):
+        for feature in features:
+            if not isinstance(feature, dict):
+                continue
             props = feature.get("properties", {})
-            value = props.get("temperature", {}).get("value")
+            if not isinstance(props, dict):
+                continue
+            temperature = props.get("temperature", {})
+            if not isinstance(temperature, dict):
+                continue
+            value = temperature.get("value")
             stamp = props.get("timestamp")
             if value is None or not stamp:
                 continue
@@ -271,9 +303,11 @@ async def collect_metar_observations(
     with get_db(db_path) as conn:
         data = response.json()
         if not isinstance(data, list):
-            data = []
+            raise ValueError("AviationWeather METAR response must be a JSON list")
         unparseable = 0
         for item in data:
+            if not isinstance(item, dict):
+                continue
             # obsTime is an unambiguous epoch; reportTime is a naive UTC string,
             # so prefer the former and only ever treat the latter as UTC.
             stamp = item.get("obsTime")
@@ -333,7 +367,7 @@ async def collect_gamma_resolutions(
     target: date,
     db_path: Path | None = None,
 ) -> dict[str, int]:
-    events = await fetch_resolved_weather_events(client, target)
+    events = await fetch_resolved_weather_events(client, target, strict=True)
     inserted = unchanged = 0
     collected = utc_now()
     with get_db(db_path) as conn:
@@ -406,58 +440,188 @@ def _cities_for_date(conn: sqlite3.Connection, target: date) -> list[str]:
     return [str(row["city"]) for row in rows if row["city"] in config.CITIES]
 
 
-async def backfill_range(
-    start: date,
-    end: date,
+PROVIDER_EXCEPTIONS = (
+    httpx.HTTPError,
+    ValueError,
+    TypeError,
+    KeyError,
+    IndexError,
+)
+
+
+def _provider_failure(source: str, exc: Exception) -> dict[str, Any]:
+    rate_limited = isinstance(exc, RateLimited) or (
+        isinstance(exc, httpx.HTTPStatusError)
+        and exc.response.status_code == 429
+    )
+    return {
+        "source": source,
+        "error_type": type(exc).__name__,
+        "error": str(exc)[:300],
+        "rate_limited": rate_limited,
+    }
+
+
+async def backfill_city_dates(
+    city_dates: Sequence[tuple[str, date]],
     db_path: Path | None = None,
-) -> dict[str, int]:
-    if end < start:
-        raise ValueError("--to must not precede --from")
+    *,
+    include_forecast_summaries: bool = False,
+) -> dict[str, Any]:
+    """Collect each selected truth grain independently with provider circuits."""
+    selected = sorted(
+        {
+            (city, target)
+            for city, target in city_dates
+            if city in config.CITIES
+        },
+        key=lambda item: (item[1], item[0]),
+        reverse=True,
+    )
+    grouped: dict[date, list[str]] = defaultdict(list)
+    for city, target in selected:
+        grouped[target].append(city)
+
     summary: Counter[str] = Counter()
+    failure_details: list[dict[str, Any]] = []
+    blocked_sources: dict[str, dict[str, Any]] = {}
     async with httpx.AsyncClient(headers={"User-Agent": config.USER_AGENT}) as client:
-        current = start
-        while current <= end:
-            with get_db(db_path) as conn:
-                cities = _cities_for_date(conn, current)
-            try:
-                result = await collect_gamma_resolutions(client, current, db_path)
-                summary["resolutions"] += result["inserted"]
-            except httpx.HTTPError:
-                summary["resolution_failures"] += 1
+        for target, cities in grouped.items():
+            failures: dict[str, list[dict[str, Any]]] = {
+                city: [] for city in cities
+            }
+            if "gamma" in blocked_sources:
+                detail = {**blocked_sources["gamma"], "skipped": "circuit_open"}
+                for city in cities:
+                    failures[city].append(detail)
+                summary["resolution_skipped"] += 1
+            else:
+                try:
+                    result = await collect_gamma_resolutions(client, target, db_path)
+                    summary["resolutions"] += result["inserted"]
+                except PROVIDER_EXCEPTIONS as exc:
+                    detail = _provider_failure("gamma", exc)
+                    failure_details.append({
+                        **detail,
+                        "target_date": target.isoformat(),
+                    })
+                    for city in cities:
+                        failures[city].append(detail)
+                    summary["resolution_failures"] += 1
+                    if detail["rate_limited"]:
+                        blocked_sources["gamma"] = detail
+
             for city_slug in cities:
-                try:
-                    if config.CITIES[city_slug].resolution_adapter == "nws":
-                        summary["station_readings"] += await collect_nws_observations(
-                            client, city_slug, current, db_path
-                        )
+                adapter = config.CITIES[city_slug].resolution_adapter
+                if adapter in blocked_sources:
+                    failures[city_slug].append({
+                        **blocked_sources[adapter],
+                        "skipped": "circuit_open",
+                    })
+                    summary["observation_skipped"] += 1
+                else:
+                    try:
+                        if adapter == "nws":
+                            readings = await collect_nws_observations(
+                                client, city_slug, target, db_path
+                            )
+                        else:
+                            readings = await collect_metar_observations(
+                                client, city_slug, target, db_path
+                            )
+                        summary["station_readings"] += readings
+                    except PROVIDER_EXCEPTIONS as exc:
+                        detail = _provider_failure(adapter, exc)
+                        failures[city_slug].append(detail)
+                        failure_details.append({
+                            **detail,
+                            "city": city_slug,
+                            "target_date": target.isoformat(),
+                        })
+                        summary["observation_failures"] += 1
+                        if detail["rate_limited"]:
+                            blocked_sources[adapter] = detail
+
+                if include_forecast_summaries:
+                    source = "previous-runs"
+                    if source in blocked_sources:
+                        failures[city_slug].append({
+                            **blocked_sources[source],
+                            "skipped": "circuit_open",
+                        })
+                        summary["forecast_skipped"] += 1
                     else:
-                        summary["station_readings"] += await collect_metar_observations(
-                            client, city_slug, current, db_path
-                        )
-                except httpx.HTTPError:
-                    summary["observation_failures"] += 1
-                try:
-                    result = await collect_previous_run_summaries(
-                        client, city_slug, current, current, db_path
-                    )
-                    summary["forecast_summaries"] += result["inserted"]
-                except httpx.HTTPError:
-                    summary["forecast_failures"] += 1
-            reconciliation = reconcile_all(current, db_path)
-            summary.update({f"reconciled_{key}": value for key, value in reconciliation.items()})
+                        try:
+                            result = await collect_previous_run_summaries(
+                                client, city_slug, target, target, db_path
+                            )
+                            summary["forecast_summaries"] += result["inserted"]
+                        except PROVIDER_EXCEPTIONS as exc:
+                            detail = _provider_failure(source, exc)
+                            failures[city_slug].append(detail)
+                            failure_details.append({
+                                **detail,
+                                "city": city_slug,
+                                "target_date": target.isoformat(),
+                            })
+                            summary["forecast_failures"] += 1
+                            if detail["rate_limited"]:
+                                blocked_sources[source] = detail
+
+            reconciliation = reconcile_all(target, db_path)
+            summary.update({
+                f"reconciled_{key}": value
+                for key, value in reconciliation.items()
+            })
             with get_db(db_path) as conn:
                 for city_slug in cities:
                     row = conn.execute(
                         """SELECT reconciliation_status FROM market_resolutions
-                           WHERE city=? AND target_date=? ORDER BY resolved_at,id LIMIT 1""",
-                        (city_slug, current.isoformat()),
+                           WHERE city=? AND target_date=?
+                           ORDER BY CASE WHEN reconciliation_status='matched'
+                                         THEN 0 ELSE 1 END,
+                                    resolved_at,id LIMIT 1""",
+                        (city_slug, target.isoformat()),
                     ).fetchone()
-                    record_resolution_retry(
-                        conn, city_slug, current,
-                        str(row["reconciliation_status"] if row else "resolution_missing"),
+                    status = str(
+                        row["reconciliation_status"]
+                        if row else "resolution_missing"
                     )
-            current += timedelta(days=1)
-    return dict(summary)
+                    record_resolution_retry(
+                        conn,
+                        city_slug,
+                        target,
+                        canonical_json({
+                            "reconciliation": status,
+                            "provider_failures": failures[city_slug],
+                        }),
+                    )
+
+    result: dict[str, Any] = dict(summary)
+    result["processed_city_dates"] = len(selected)
+    result["failure_details"] = failure_details
+    result["provider_circuits_open"] = sorted(blocked_sources)
+    return result
+
+
+async def backfill_range(
+    start: date,
+    end: date,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    if end < start:
+        raise ValueError("--to must not precede --from")
+    selected: list[tuple[str, date]] = []
+    current = start
+    while current <= end:
+        with get_db(db_path) as conn:
+            selected.extend(
+                (city, current) for city in _cities_for_date(conn, current)
+            )
+        current += timedelta(days=1)
+    return await backfill_city_dates(
+        selected, db_path, include_forecast_summaries=True
+    )
 
 
 def reconcile_all(target: date | None = None, db_path: Path | None = None) -> dict[str, int]:
@@ -574,6 +738,32 @@ def unresolved_target_dates(
     })
 
 
+def due_resolution_items(
+    db_path: Path | None = None,
+    *,
+    now: datetime | None = None,
+    limit: int | None = None,
+) -> list[tuple[str, date]]:
+    """Return a bounded, recent-first queue of past city/date truth grains."""
+    now = now or utc_now()
+    requested = config.DAILY_BACKFILL_LIMIT if limit is None else limit
+    if requested < 0:
+        raise ValueError("daily backfill limit must be non-negative")
+    eligible: list[tuple[str, date]] = []
+    for item in unresolved_city_dates(db_path, now=now, due_only=True):
+        city = str(item["city"])
+        target = date.fromisoformat(str(item["target_date"]))
+        if city not in config.CITIES:
+            continue
+        local_today = now.astimezone(
+            ZoneInfo(config.CITIES[city].timezone)
+        ).date()
+        if target < local_today:
+            eligible.append((city, target))
+    eligible.sort(key=lambda item: (item[1], item[0]), reverse=True)
+    return eligible[:requested]
+
+
 def abandoned_target_dates(
     db_path: Path | None = None,
     max_age_days: int | None = None,
@@ -634,6 +824,9 @@ def collection_status(db_path: Path | None = None, now: datetime | None = None) 
     expected = int(recent_runs["expected"] or 0)
     captured = int(recent_runs["captured"] or 0)
     archive_manifests = sorted((config.DATA_DIR / "archive").glob("????-??/manifest.json"))
+    recent_exclusions = overlapping_exclusions(
+        now - timedelta(days=7), now
+    )
     return {
         "counts": counts,
         "forecast_freshness_minutes": freshness_minutes,
@@ -649,6 +842,8 @@ def collection_status(db_path: Path | None = None, now: datetime | None = None) 
         "models": models,
         "scan_coverage_7d": captured / expected if expected else 0.0,
         "scan_days_7d": int(recent_runs["days"] or 0),
+        "prospective_window_uninterrupted": not recent_exclusions,
+        "prospective_capture_exclusions_7d": exclusions_manifest(recent_exclusions),
         "archive_latest": str(archive_manifests[-1]) if archive_manifests else None,
         "archive_verified": _verify_archive_manifests(),
     }
@@ -951,6 +1146,7 @@ def train_candidate(
             "lead_basis": lead_basis,
             "lead_bucket": lead,
             "legacy_tables_included": False,
+            "capture_exclusions": exclusions_manifest(),
         }
         body = {
             "algorithm": algorithm,
@@ -1000,7 +1196,8 @@ def _verify_archive_manifests() -> bool:
 def operational_acceptance(conn: sqlite3.Connection, now: datetime | None = None) -> dict[str, Any]:
     """Evaluate the seven-day pre-promotion collection acceptance contract."""
     now = now or utc_now()
-    start = iso_utc(now - timedelta(days=7))
+    window_start = now - timedelta(days=7)
+    start = iso_utc(window_start)
     runs = conn.execute(
         "SELECT * FROM collection_runs WHERE completed_at>=? ORDER BY completed_at", (start,)
     ).fetchall()
@@ -1028,12 +1225,15 @@ def operational_acceptance(conn: sqlite3.Connection, now: datetime | None = None
         "SELECT MAX(last_seen_at) AS latest FROM forecast_snapshots WHERE quality_status='ok' AND schema_version=3"
     ).fetchone()["latest"]
     freshness = (now - parse_utc(latest)).total_seconds() / 60 if latest else math.inf
+    capture_gaps = overlapping_exclusions(window_start, now)
     result = {
         "run_days": len(run_days),
         "scan_coverage": coverage,
         "provenance_complete": bool(provenance["total"] and not provenance["missing"]),
         "forecast_fresh": freshness <= 30,
         "resolution_within_48h": resolution_ratio,
+        "prospective_window_uninterrupted": not capture_gaps,
+        "capture_exclusions": exclusions_manifest(capture_gaps),
         "archive_verified": _verify_archive_manifests(),
     }
     result["passed"] = bool(
@@ -1041,6 +1241,7 @@ def operational_acceptance(conn: sqlite3.Connection, now: datetime | None = None
         and result["scan_coverage"] >= .95
         and result["provenance_complete"]
         and result["forecast_fresh"]
+        and result["prospective_window_uninterrupted"]
         and result["resolution_within_48h"] >= .95
         and result["archive_verified"]
     )
@@ -1402,6 +1603,7 @@ def archive_month(month: str, db_path: Path | None = None, out_dir: Path | None 
             "accepted_reconciliation_statuses": ["matched"],
             "matched_expected_city_dates": len(cohort),
             "reconciliation_provenance": provenance,
+            "capture_exclusions": exclusions_manifest(),
         }
         revision_dir.mkdir(parents=True, exist_ok=False)
         for table, column in date_columns.items():

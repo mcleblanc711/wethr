@@ -18,6 +18,12 @@ REPO_ROOT = COLLECTOR_ROOT.parent
 
 DATA_DIR = Path(os.getenv("WETHR_DATA_DIR", str(REPO_ROOT / "data"))).expanduser()
 DB_PATH = Path(os.getenv("WETHR_DB_PATH", str(DATA_DIR / "wethr.db"))).expanduser()
+CALIBRATION_EXCLUSIONS_PATH = Path(
+    os.getenv(
+        "WETHR_CALIBRATION_EXCLUSIONS_PATH",
+        str(COLLECTOR_ROOT / "calibration_exclusions.json"),
+    )
+).expanduser()
 
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -25,6 +31,12 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 # How long a writer waits for the SQLite lock before giving up. The collector
 # loop and the calibration timers write to the same file.
 DB_BUSY_TIMEOUT_S = float(os.getenv("WETHR_DB_BUSY_TIMEOUT", "30"))
+
+# The daily truth/reconciliation queue is deliberately bounded. Recent items
+# come first because METAR history has a short provider retention window; old
+# unresolved items remain durable and retry on later runs.
+DAILY_BACKFILL_LIMIT = int(os.getenv("WETHR_DAILY_BACKFILL_LIMIT", "60"))
+
 
 # ---------------------------------------------------------------------------
 # Gamma API (Polymarket market discovery)

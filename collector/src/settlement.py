@@ -49,6 +49,8 @@ log = logging.getLogger(__name__)
 async def fetch_resolved_weather_events(
     client: httpx.AsyncClient,
     target_date: date,
+    *,
+    strict: bool = False,
 ) -> list[dict]:
     """
     Fetch closed weather temperature events from Gamma API for a specific date.
@@ -79,10 +81,18 @@ async def fetch_resolved_weather_events(
             resp.raise_for_status()
             data = resp.json()
 
-            if not isinstance(data, list) or len(data) == 0:
+            if not isinstance(data, list):
+                if strict:
+                    raise ValueError(
+                        "Gamma resolved-events response must be a JSON list"
+                    )
+                break
+            if not data:
                 break
 
             for event in data:
+                if not isinstance(event, dict):
+                    continue
                 title = event.get("title", "").lower()
                 if "highest temperature" not in title:
                     continue
@@ -96,8 +106,10 @@ async def fetch_resolved_weather_events(
                 break
             offset += limit
 
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, json.JSONDecodeError) as e:
             log.warning(f"Gamma API error fetching resolved events: {e}")
+            if strict:
+                raise
             break
 
     log.info(f"Found {len(events)} resolved weather events for {target_date}")

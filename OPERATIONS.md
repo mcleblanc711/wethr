@@ -60,6 +60,16 @@ systemctl --user daemon-reload
 systemctl --user enable --now wethr-export.timer
 ```
 
+The checked-in audit workflow polls hourly but its `Audit Due?` gate permits
+only one production run per Edmonton calendar day after 09:00. This catches up
+after a host/container restart that missed 09:00 without sending hourly
+Telegram summaries. `python3 run.py doctor` compares the audit ledger with the
+most recent expected 09:00 run; a running container alone is not audit health.
+
+Workflow JSON is source control, not automatic deployment. After changing
+`n8n-wethr/workflows/audit.json`, import it into n8n, publish/activate it, and
+verify that `Hourly Catch-up Trigger -> Audit Due? -> Start Run` is active.
+
 If the repo was moved, recreate n8n from this checkout so Docker bind mounts point
 at the right `wethr-output` directory:
 
@@ -96,7 +106,22 @@ systemctl --user enable --now wethr-calibration-daily.timer
 systemctl --user enable --now wethr-calibration-monthly.timer
 ```
 
-The daily job retries every unresolved target date regardless of age. The
-monthly job writes immutable Parquet partitions plus row-count/SHA-256 manifests
-under `data/archive/YYYY-MM/`, then creates shadow candidates. A candidate must
-still be explicitly evaluated and promoted; live trading remains disabled.
+The daily job captures prospective forecasts, then processes at most
+`WETHR_DAILY_BACKFILL_LIMIT` due city/date truth grains (60 by default).
+It only selects dates whose calendar day has ended in that city's timezone,
+prioritizes recent past dates because METAR history expires quickly, persists
+provider failures on the retry row, and opens a per-run circuit after a 429 so
+one provider cannot abort or flood the remaining batch. Older unresolved items
+remain durable for later retries. The daily truth path does not request
+untrainable Open-Meteo Previous Runs summaries; use a narrow explicit
+`backfill --from ... --to ...` when those audit summaries are needed.
+
+Known prospective-capture outages are declared in
+`collector/calibration_exclusions.json`. Training queries reject captures in
+those intervals, archive and candidate manifests retain the exclusions, and the
+promotion acceptance gate requires a new uninterrupted seven-day window.
+
+The monthly job writes immutable Parquet partitions plus row-count/SHA-256
+manifests under `data/archive/YYYY-MM/`, then creates shadow candidates. A
+candidate must still be explicitly evaluated and promoted; live trading remains
+disabled.

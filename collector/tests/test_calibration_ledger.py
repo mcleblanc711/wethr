@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import json
+import sqlite3
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -876,3 +877,239 @@ def test_promotion_persists_complete_route_transition_report(db_path, monkeypatc
     assert report["candidate_metrics"] == fresh_metrics
     assert report["gates"] == {"fresh": True}
     assert parse_utc(report["evaluated_at"])
+
+
+def test_declared_capture_gap_is_excluded_from_training(
+    db_path, tmp_path, monkeypatch,
+):
+    exclusion_path = tmp_path / "exclusions.json"
+    exclusion_path.write_text(json.dumps({
+        "schema_version": 1,
+        "exclusions": [{
+            "id": "fixture-gap",
+            "kind": "prospective_capture_gap",
+            "started_at": "2026-07-09T00:00:00Z",
+            "ended_at": "2026-07-10T00:00:00Z",
+            "reason": "fixture host downtime",
+        }],
+    }), encoding="utf-8")
+    monkeypatch.setattr(
+        config, "CALIBRATION_EXCLUSIONS_PATH", exclusion_path
+    )
+    target = date(2026, 7, 10)
+    with get_db(db_path) as conn:
+        _seed_station_truth(conn, "london", "EGLC", target)
+        clean_id, _ = record_forecast_snapshot(
+            conn,
+            ForecastSnapshotInput(
+                city="london",
+                target_date=target,
+                seen_at=datetime(2026, 7, 8, 12, tzinfo=UTC),
+                provider="fixture",
+                model="eps",
+                members_c=[23, 24, 25],
+                source_endpoint="fixture://ensemble",
+            ),
+        )
+        gap_id, _ = record_forecast_snapshot(
+            conn,
+            ForecastSnapshotInput(
+                city="london",
+                target_date=target,
+                seen_at=datetime(2026, 7, 9, 12, tzinfo=UTC),
+                provider="fixture",
+                model="eps",
+                members_c=[24, 25, 26],
+                source_endpoint="fixture://ensemble",
+            ),
+        )
+        rows = training_forecast_rows(
+            conn, lead_basis="capture_cutoff"
+        )
+    assert [row["id"] for row in rows] == [clean_id]
+    assert gap_id not in {row["id"] for row in rows}
+
+
+def _insert_expected_trade(conn, city: str, target: date) -> None:
+    conn.execute(
+        """INSERT INTO trades (
+               city,target_date,bracket_label,bracket_unit,side,entry_price,
+               size_usd,model_prob,market_prob,edge,member_count,total_members,
+               confidence,kelly_full,kelly_frac,settled
+           ) VALUES (?,?,?,'C','YES',.4,10,.5,.4,.1,20,50,.8,.1,.05,0)""",
+        (city, target.isoformat(), "25C"),
+    )
+
+
+def test_due_truth_queue_is_bounded_recent_first_and_past_only(db_path):
+    """A target is due only after that city's local calendar day ends."""
+    from src.calibration_ops import due_resolution_items
+
+    now = datetime(2026, 7, 20, 1, tzinfo=UTC)
+    with get_db(db_path) as conn:
+        for target in (
+            date(2026, 7, 18),
+            date(2026, 7, 19),
+            date(2026, 7, 21),
+        ):
+            _insert_expected_trade(conn, "london", target)
+        _insert_expected_trade(conn, "los_angeles", date(2026, 7, 19))
+    assert due_resolution_items(db_path, now=now, limit=10) == [
+        ("london", date(2026, 7, 19)),
+        ("london", date(2026, 7, 18)),
+    ]
+
+
+def test_bad_provider_payload_is_isolated_and_persisted(
+    db_path, monkeypatch,
+):
+    from src import calibration_ops as ops
+
+    target = date(2026, 8, 4)
+
+    async def gamma_ok(*_args, **_kwargs):
+        return {"inserted": 0, "unchanged": 0}
+
+    async def observations(_client, city, *_args, **_kwargs):
+        if city == "paris":
+            raise ValueError("fixture invalid JSON shape")
+        return 3
+
+    monkeypatch.setattr(ops, "collect_gamma_resolutions", gamma_ok)
+    monkeypatch.setattr(ops, "collect_metar_observations", observations)
+    result = asyncio.run(ops.backfill_city_dates(
+        [("london", target), ("paris", target)],
+        db_path,
+    ))
+    assert result["processed_city_dates"] == 2
+    assert result["observation_failures"] == 1
+    assert result["station_readings"] == 3
+    with get_db(db_path) as conn:
+        retries = conn.execute(
+            """SELECT city,last_result FROM resolution_retry_state
+               ORDER BY city"""
+        ).fetchall()
+    assert [row["city"] for row in retries] == ["london", "paris"]
+    paris = json.loads(retries[1]["last_result"])
+    assert paris["provider_failures"][0]["error_type"] == "ValueError"
+
+
+def test_rate_limit_opens_provider_circuit_for_remaining_grains(
+    db_path, monkeypatch,
+):
+    import httpx
+    from src import calibration_ops as ops
+
+    target = date(2026, 8, 4)
+    calls: list[str] = []
+
+    async def gamma_ok(*_args, **_kwargs):
+        return {"inserted": 0, "unchanged": 0}
+
+    async def rate_limited(_client, city, *_args, **_kwargs):
+        calls.append(city)
+        request = httpx.Request("GET", "https://fixture.test/metar")
+        response = httpx.Response(429, request=request)
+        raise httpx.HTTPStatusError(
+            "fixture rate limit", request=request, response=response
+        )
+
+    monkeypatch.setattr(ops, "collect_gamma_resolutions", gamma_ok)
+    monkeypatch.setattr(ops, "collect_metar_observations", rate_limited)
+    result = asyncio.run(ops.backfill_city_dates(
+        [("london", target), ("paris", target)],
+        db_path,
+    ))
+    assert calls == ["paris"]
+    assert result["observation_failures"] == 1
+    assert result["observation_skipped"] == 1
+    assert result["provider_circuits_open"] == [
+        "aviationweather-metar"
+    ]
+
+
+def test_operational_acceptance_fails_across_declared_downtime(db_path):
+    from src.calibration_ops import operational_acceptance
+
+    with get_db(db_path) as conn:
+        result = operational_acceptance(
+            conn, now=datetime(2026, 8, 5, 18, tzinfo=UTC)
+        )
+    assert not result["prospective_window_uninterrupted"]
+    assert {
+        item["id"]
+        for item in result["capture_exclusions"]["exclusions"]
+    } == {
+        "prospective-gap-2026-08-02-a",
+        "prospective-gap-2026-08-04-b",
+    }
+    assert not result["passed"]
+
+
+def test_n8n_workflow_has_once_daily_catch_up_gate():
+    workflow = json.loads(
+        (
+            config.REPO_ROOT
+            / "n8n-wethr"
+            / "workflows"
+            / "audit.json"
+        ).read_text(encoding="utf-8")
+    )
+    trigger = next(
+        node
+        for node in workflow["nodes"]
+        if node["name"] == "Hourly Catch-up Trigger"
+    )
+    assert trigger["parameters"]["rule"]["interval"] == [{
+        "field": "hours",
+        "hoursInterval": 1,
+    }]
+    assert (
+        workflow["connections"]["Hourly Catch-up Trigger"]["main"][0][0]["node"]
+        == "Audit Due?"
+    )
+    assert (
+        workflow["connections"]["Audit Due?"]["main"][0][0]["node"]
+        == "Start Run"
+    )
+    due = next(
+        node for node in workflow["nodes"] if node["name"] == "Audit Due?"
+    )
+    assert "current.hour) < 9" in due["parameters"]["jsCode"]
+    assert "status = 'completed'" in due["parameters"]["jsCode"]
+
+
+def test_audit_db_status_detects_missed_and_current_schedule(tmp_path):
+    from src.ops import audit_db_status
+
+    path = tmp_path / "audit.db"
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """CREATE TABLE audit_runs (
+                   run_id TEXT PRIMARY KEY,
+                   started_at TEXT NOT NULL,
+                   finished_at TEXT,
+                   status TEXT NOT NULL
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO audit_runs VALUES (
+                   'old','2026-08-02T15:00:00Z',
+                   '2026-08-02T15:01:00Z','completed'
+               )"""
+        )
+    now = datetime(2026, 8, 5, 18, tzinfo=UTC)
+    stale = audit_db_status(path, now=now)
+    assert stale["stale"]
+    assert stale["expected_since"] == "2026-08-05T15:00:00Z"
+
+    with sqlite3.connect(path) as conn:
+        conn.execute(
+            """INSERT INTO audit_runs VALUES (
+                   'today','2026-08-05T15:01:00Z',
+                   '2026-08-05T15:02:00Z','completed'
+               )"""
+        )
+    current = audit_db_status(path, now=now)
+    assert not current["stale"]
+    assert current["latest_started_at"] == "2026-08-05T15:01:00Z"
