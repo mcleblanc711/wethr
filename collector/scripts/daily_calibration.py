@@ -4,45 +4,63 @@ from __future__ import annotations
 
 import asyncio
 import json
-from datetime import timedelta
 
 import httpx
 
 from src import config
 from src.calibration_ops import (
-    backfill_range, collect_prospective_forecasts, collection_status, reconcile_all,
-    unresolved_target_dates,
+    backfill_city_dates, collect_prospective_forecasts, collection_status,
+    due_resolution_items, reconcile_all,
 )
-from src.ledger import utc_now
 from src.paper_trader import init_db
 from src.telegram import send_message
 
 
 async def run() -> None:
     init_db()
-    today = utc_now().date()
-    targets = set(unresolved_target_dates())
-    targets.add(today - timedelta(days=1))
+    queue = due_resolution_items()
     async with httpx.AsyncClient(headers={"User-Agent": config.USER_AGENT}) as client:
         prospective = await collect_prospective_forecasts(client)
-    totals = {"prospective": prospective, "backfill": {}, "reconcile": {}}
-    for target in sorted(targets):
-        totals["backfill"][target.isoformat()] = await backfill_range(target, target)
-    totals["reconcile"] = reconcile_all()
+    backfill = await backfill_city_dates(queue)
+    totals = {
+        "prospective": prospective,
+        "backfill": backfill,
+        "queue": {
+            "limit": config.DAILY_BACKFILL_LIMIT,
+            "selected": [
+                {"city": city, "target_date": target.isoformat()}
+                for city, target in queue
+            ],
+        },
+        "reconcile": reconcile_all(),
+    }
     status = collection_status()
     totals["status"] = status
     alerts = []
+    if backfill["failure_details"]:
+        alerts.append(
+            f"{len(backfill['failure_details'])} provider grains failed; "
+            "details were persisted for retry"
+        )
+    if not status["prospective_window_uninterrupted"]:
+        alerts.append(
+            "the seven-day prospective window overlaps an explicit host-downtime gap"
+        )
     if status["forecast_stale"]:
         alerts.append("forecast freshness exceeds 30 minutes")
     if status["member_count_failures"]:
         alerts.append("expected ensemble members are missing")
     if status["unresolved_items_older_than_3d"]:
+        overdue = status["unresolved_items_older_than_3d"]
+        sample = overdue[:20]
+        remainder = len(overdue) - len(sample)
         alerts.append(
-            "unresolved outcomes older than 3 days: "
+            f"{len(overdue)} unresolved outcomes older than 3 days; oldest sample: "
             + ", ".join(
                 f"{item['city']}/{item['target_date']}"
-                for item in status["unresolved_items_older_than_3d"]
+                for item in sample
             )
+            + (f" (+{remainder} more)" if remainder else "")
         )
     if status["reconciliation_discrepancies"]:
         alerts.append(

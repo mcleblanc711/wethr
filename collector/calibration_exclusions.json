@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "exclusions": [
+    {
+      "id": "prospective-gap-2026-08-02-a",
+      "kind": "prospective_capture_gap",
+      "started_at": "2026-08-03T04:12:00Z",
+      "ended_at": "2026-08-05T01:34:00Z",
+      "reason": "Collector host offline; original forecast information cutoffs cannot be recreated."
+    },
+    {
+      "id": "prospective-gap-2026-08-04-b",
+      "kind": "prospective_capture_gap",
+      "started_at": "2026-08-05T04:01:00Z",
+      "ended_at": "2026-08-05T16:31:00Z",
+      "reason": "Collector host offline; original forecast information cutoffs cannot be recreated."
+    }
+  ]
+}

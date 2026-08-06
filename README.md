@@ -53,7 +53,8 @@ collector, containers, services, or timers.
 `uv run python run.py export-settled` writes
 `n8n-wethr/wethr-output/settled_trades.json`, the file consumed by the audit
 workflow. `uv run python run.py doctor` reports the DB path, recent table
-activity, export status, and any legacy `collector/data` database still present.
+activity, export status, latest expected/successful n8n audit run, explicit
+capture-gap eligibility, and any legacy `collector/data` database still present.
 
 ## License
 

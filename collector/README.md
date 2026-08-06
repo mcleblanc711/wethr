@@ -126,6 +126,8 @@ All settings in `src/config.py`, overridable via `WETHR_` environment variables:
 |----------|---------|-------------|
 | `WETHR_DB_PATH` | `../data/wethr.db` | Shared SQLite database path |
 | `WETHR_DATA_DIR` | `../data` | Shared data directory |
+| `WETHR_CALIBRATION_EXCLUSIONS_PATH` | `calibration_exclusions.json` | Explicit prospective-capture gaps |
+| `WETHR_DAILY_BACKFILL_LIMIT` | `60` | Maximum due truth city/dates per daily run |
 | `WETHR_MIN_EDGE` | 0.08 | Minimum edge (8%) to trade |
 | `WETHR_KELLY_FRAC` | 0.05 | Fractional Kelly multiplier |
 | `WETHR_MAX_TRADE` | 100.0 | Max USD per trade |
@@ -223,3 +225,10 @@ complete member values and verified prospective capture cutoffs; deterministic
 Previous Runs summaries are retained for audit but marked untrainable. Gamma is
 authoritative for bracket scoring, while NWS/METAR station readings are used for
 reconciled continuous targets. Open-Meteo ERA5 remains audit-only.
+
+The scheduled truth collector processes a bounded, recent-first city/date queue
+and persists provider failures without aborting other grains. A provider 429
+opens a circuit for the remainder of that run. Known host-offline intervals live
+in `calibration_exclusions.json`; they are excluded from training and retained
+in candidate/archive manifests, and promotion requires a later uninterrupted
+seven-day prospective window.

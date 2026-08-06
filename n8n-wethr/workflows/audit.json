@@ -12,8 +12,8 @@
         "rule": {
           "interval": [
             {
-              "triggerAtHour": 9,
-              "triggerAtMinute": 0
+              "field": "hours",
+              "hoursInterval": 1
             }
           ]
         }
@@ -25,7 +25,7 @@
         96
       ],
       "id": "80eb4db3-6963-4a02-80ea-3a6719b1dc99",
-      "name": "Daily 9AM Trigger"
+      "name": "Hourly Catch-up Trigger"
     },
     {
       "parameters": {
@@ -254,7 +254,7 @@
     {
       "parameters": {
         "chatId": "8670810799",
-        "text": "\u26a0\ufe0f *Wethr Divergence Audit*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\nNo settled trades to audit today.\nThe export file was empty \u2014 check Wethr's export pipeline.",
+        "text": "\u26a0\ufe0f *Wethr Divergence Audit*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\nNo trades were settled within the current export window.\nThis does not report collector scans or new positions; check collector status separately.",
         "additionalFields": {
           "parse_mode": "Markdown"
         }
@@ -273,6 +273,19 @@
           "name": "Telegram Wethr Bot"
         }
       }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Scheduled audits run once per Edmonton calendar day after 09:00.\n// The hourly trigger is only a catch-up opportunity after a missed schedule.\nconst sqlite3 = require('sqlite3');\nconst mode = ($execution && $execution.mode) ? $execution.mode : 'manual';\nif (mode !== 'production') {\n  return $input.all().length ? $input.all() : [{ json: { audit_due: true } }];\n}\n\nconst timeZone = 'America/Edmonton';\nconst now = new Date();\nconst formatter = new Intl.DateTimeFormat('en-CA', {\n  timeZone,\n  year: 'numeric',\n  month: '2-digit',\n  day: '2-digit',\n  hour: '2-digit',\n  hourCycle: 'h23',\n});\nconst partsFor = (value) => Object.fromEntries(\n  formatter.formatToParts(value)\n    .filter(part => part.type !== 'literal')\n    .map(part => [part.type, part.value])\n);\nconst current = partsFor(now);\nif (Number(current.hour) < 9) return [];\nconst currentDay = `${current.year}-${current.month}-${current.day}`;\n\nconst db = new sqlite3.Database('/data/wethr/wethr_audit.db');\nconst latest = await new Promise((resolve, reject) => {\n  db.get(\n    `SELECT started_at FROM audit_runs\n      WHERE status = 'completed'\n      ORDER BY started_at DESC LIMIT 1`,\n    [],\n    (err, row) => err ? reject(err) : resolve(row)\n  );\n});\nawait new Promise(resolve => db.close(() => resolve()));\n\nif (latest && latest.started_at) {\n  const previous = partsFor(new Date(latest.started_at));\n  const previousDay = `${previous.year}-${previous.month}-${previous.day}`;\n  if (previousDay === currentDay) return [];\n}\nreturn [{ json: { audit_due: true, local_day: currentDay } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        200,
+        96
+      ],
+      "id": "audit-due-0001",
+      "name": "Audit Due?"
     },
     {
       "parameters": {
@@ -438,7 +451,18 @@
         ]
       ]
     },
-    "Daily 9AM Trigger": {
+    "Hourly Catch-up Trigger": {
+      "main": [
+        [
+          {
+            "node": "Audit Due?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit Due?": {
       "main": [
         [
           {
@@ -577,7 +601,7 @@
     "errorWorkflow": "WethrErrorAlert01"
   },
   "staticData": {
-    "node:Daily 9AM Trigger": {
+    "node:Hourly Catch-up Trigger": {
       "recurrenceRules": []
     }
   },

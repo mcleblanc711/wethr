@@ -19,6 +19,7 @@ from typing import Any, Sequence
 from zoneinfo import ZoneInfo
 
 from . import config
+from .eligibility import load_capture_exclusions
 
 SCHEMA_VERSION = 3
 LEGACY_MODEL_VERSION = "legacy-emos-2026-04-08"
@@ -841,6 +842,13 @@ def training_forecast_rows(
         "f.issued_at < r.resolved_at",
     ]
     params: list[Any] = [lead_basis, SCHEMA_VERSION]
+    # Prospective capture gaps are explicit evidence exclusions. Normally no
+    # snapshots exist inside a host-offline interval, but this also fails closed
+    # if a later import tries to synthesize or relabel those missing cutoffs.
+    for exclusion in load_capture_exclusions():
+        item = exclusion.as_manifest_dict()
+        clauses.append("NOT (f.first_seen_at>=? AND f.first_seen_at<?)")
+        params.extend([item["started_at"], item["ended_at"]])
     if lead_bucket_name:
         clauses.append("f.lead_bucket=?")
         params.append(lead_bucket_name)

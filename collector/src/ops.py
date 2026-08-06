@@ -10,8 +10,10 @@ from __future__ import annotations
 import json
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from . import config
 from .paper_trader import init_db
@@ -43,6 +45,87 @@ SETTLED_EXPORT_COLUMNS = (
 def default_settled_export_path() -> Path:
     """Return the JSON path mounted into n8n as /data/wethr/settled_trades.json."""
     return config.REPO_ROOT / "n8n-wethr" / "wethr-output" / "settled_trades.json"
+
+
+def default_audit_db_path() -> Path:
+    return (
+        config.REPO_ROOT
+        / "n8n-wethr"
+        / "wethr-output"
+        / "wethr_audit.db"
+    )
+
+
+def _parse_utc(value: str) -> datetime:
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        raise ValueError("audit timestamp lacks a timezone")
+    return parsed.astimezone(timezone.utc)
+
+
+def audit_db_status(
+    path: Path | None = None,
+    *,
+    now: datetime | None = None,
+    timezone_name: str = "America/Edmonton",
+    scheduled_hour: int = 9,
+    grace_minutes: int = 15,
+) -> dict[str, Any]:
+    """Report whether the latest successful n8n run met today's schedule."""
+    audit_path = path or default_audit_db_path()
+    current = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    result: dict[str, Any] = {
+        "path": str(audit_path),
+        "exists": audit_path.exists(),
+        "latest_started_at": None,
+        "latest_finished_at": None,
+        "latest_status": None,
+        "expected_since": None,
+        "stale": True,
+        "age_hours": None,
+        "error": None,
+    }
+    local_now = current.astimezone(ZoneInfo(timezone_name))
+    scheduled = local_now.replace(
+        hour=scheduled_hour,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if local_now < scheduled + timedelta(minutes=grace_minutes):
+        scheduled -= timedelta(days=1)
+    expected = scheduled.astimezone(timezone.utc)
+    result["expected_since"] = expected.isoformat().replace("+00:00", "Z")
+    if not audit_path.exists():
+        return result
+    try:
+        uri = f"file:{audit_path}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute(
+                """SELECT started_at,finished_at,status
+                   FROM audit_runs
+                   WHERE status='completed'
+                   ORDER BY started_at DESC LIMIT 1"""
+            ).fetchone()
+    except (sqlite3.Error, OSError, ValueError) as exc:
+        result["error"] = str(exc)
+        return result
+    if row is None:
+        return result
+    try:
+        latest = _parse_utc(str(row["started_at"]))
+    except ValueError as exc:
+        result["error"] = str(exc)
+        return result
+    result.update({
+        "latest_started_at": str(row["started_at"]),
+        "latest_finished_at": row["finished_at"],
+        "latest_status": str(row["status"]),
+        "stale": latest < expected,
+        "age_hours": (current - latest).total_seconds() / 3600,
+    })
+    return result
 
 
 def export_settled_trades(
@@ -149,6 +232,7 @@ def doctor_report() -> str:
     legacy_db = config.COLLECTOR_ROOT / "data" / "wethr.db"
     export_path = default_settled_export_path()
     export_status = _json_file_status(export_path)
+    audit_status = audit_db_status()
 
     lines = [
         "Wethr local status",
@@ -186,6 +270,9 @@ def doctor_report() -> str:
     lines.append(f"  unresolved dates: {len(status['unresolved_dates'])} ({len(status['unresolved_older_than_3d'])} older than 3d)")
     lines.append(f"  reconciliation discrepancies: {status['reconciliation_discrepancies']}")
     lines.append(f"  7d scan coverage: {status['scan_coverage_7d']:.1%} across {status['scan_days_7d']} day(s)")
+    lines.append(
+        f"  prospective window uninterrupted: {status['prospective_window_uninterrupted']}"
+    )
     lines.append(f"  archive: {status['archive_latest'] or 'missing'} (verified={status['archive_verified']})")
     active = [model['id'] for model in status['models'] if model['status'] == 'active']
     shadow = [model['id'] for model in status['models'] if model['status'] in {'candidate', 'shadow'}]
@@ -194,4 +281,14 @@ def doctor_report() -> str:
 
     lines.append("")
     lines.append("n8n expected mount: n8n-wethr/wethr-output -> /data/wethr")
+    age = audit_status["age_hours"]
+    age_text = "unknown" if age is None else f"{age:.1f}h"
+    lines.append(
+        "n8n audit: "
+        f"latest={audit_status['latest_started_at'] or 'missing'}, "
+        f"age={age_text}, stale={audit_status['stale']}, "
+        f"expected_since={audit_status['expected_since']}"
+    )
+    if audit_status["error"]:
+        lines.append(f"n8n audit error: {audit_status['error']}")
     return "\n".join(lines)
