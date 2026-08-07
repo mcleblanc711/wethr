@@ -136,11 +136,31 @@ All settings in `src/config.py`, overridable via `WETHR_` environment variables:
 | `WETHR_DAILY_LOSS` | 300.0 | Daily loss circuit breaker |
 | `WETHR_SCAN_INTERVAL` | 600 | Seconds between scans (10 minutes) |
 | `WETHR_LIVE` | 0 | Set to 1 for live trading |
-| `WETHR_TELEGRAM_BOT_TOKEN` | unset | Telegram bot token for new-position alerts |
-| `WETHR_TELEGRAM_CHAT_ID` | unset | Telegram chat ID for new-position alerts |
+| `WETHR_TELEGRAM_BOT_TOKEN` | unset | Telegram bot token for alerts and read-only commands |
+| `WETHR_TELEGRAM_CHAT_ID` | unset | Authorized Telegram chat ID for alerts and commands |
 | `WETHR_TELEGRAM_MESSAGE_THREAD_ID` | unset | Optional topic/thread ID for forum chats |
 
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are also accepted as aliases.
+
+## Telegram commands
+
+The optional `wethr-telegram.service` runs one local long-polling consumer for
+the configured bot. It accepts commands only from `WETHR_TELEGRAM_CHAT_ID` and
+is read-only: `/positions`, `/pnl`, `/status`, and `/help`. `/status` reports
+ledger timestamps, not a claim that the collector service is healthy.
+
+Install it only after configuring the token and authorized chat ID in a user
+systemd drop-in or secret environment file:
+
+```bash
+cp ../deploy/systemd/wethr-telegram.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now wethr-telegram.service
+```
+
+Do not configure a Telegram webhook or a second polling process for the same
+bot; Telegram updates have one consumer. Stopping the service is sufficient to
+disable command handling and does not affect trade alerts.
 
 ## Live trading
 

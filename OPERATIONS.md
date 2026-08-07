@@ -40,6 +40,25 @@ systemctl --user status wethr-collector.service
 journalctl --user -u wethr-collector.service -f
 ```
 
+## Telegram command bot
+
+New-position alerts are outbound-only. To add read-only commands from the
+configured Telegram chat (`/positions`, `/pnl`, `/status`, `/help`), install the
+separate long-polling service after supplying `WETHR_TELEGRAM_BOT_TOKEN` and
+`WETHR_TELEGRAM_CHAT_ID` through a user systemd drop-in or secret environment
+file:
+
+```bash
+cp ~/projects/wethr/deploy/systemd/wethr-telegram.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now wethr-telegram.service
+```
+
+The service is deliberately read-only and ignores messages from every other
+chat. It must be the only webhook/polling consumer for that bot. Enabling it is
+an operational action; this repository change does not configure credentials or
+start the service.
+
 ## n8n Audit
 
 The audit reads `n8n-wethr/wethr-output/settled_trades.json` as

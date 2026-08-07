@@ -446,6 +446,9 @@ def main():
     # doctor
     sub.add_parser("doctor", help="Show local database/export wiring status")
 
+    # telegram-bot
+    sub.add_parser("telegram-bot", help="Run the read-only Telegram command bot")
+
     add_calibration_commands(sub)
 
     args = parser.parse_args()
@@ -582,6 +585,15 @@ def main():
         from .ops import doctor_report
 
         print(doctor_report())
+
+    elif args.command == "telegram-bot":
+        from .telegram_bot import run_bot
+
+        try:
+            asyncio.run(run_bot())
+        except RuntimeError as exc:
+            print(f"Telegram bot not started: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
 
 
 if __name__ == "__main__":
