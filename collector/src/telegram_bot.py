@@ -11,6 +11,7 @@ import httpx
 
 from . import config
 from .paper_trader import get_db, get_pending_trades, get_stats
+from .telegram import _failure_detail, send_message
 
 log = logging.getLogger(__name__)
 
@@ -60,13 +61,7 @@ def format_positions(db_path: Path | None = None) -> str:
 def format_pnl(db_path: Path | None = None) -> str:
     """Format lifetime realized paper P/L from the canonical trade ledger."""
     stats = get_stats(db_path)
-    with get_db(db_path) as conn:
-        row = conn.execute(
-            "SELECT COALESCE(SUM(size_usd), 0) AS settled_stake "
-            "FROM trades WHERE settled = 1"
-        ).fetchone()
-    settled_stake = float(row["settled_stake"])
-    roi = (stats.gross_pnl / settled_stake) if settled_stake else 0.0
+    roi = (stats.gross_pnl / stats.settled_stake) if stats.settled_stake else 0.0
     return _limit_message(
         "Lifetime paper P/L\n"
         f"Realized P/L: ${stats.gross_pnl:+,.2f}\n"
@@ -157,32 +152,14 @@ class TelegramCommandBot:
     async def _send_reply(
         self, client: Any, message: dict[str, Any], text: str
     ) -> bool:
-        payload: dict[str, Any] = {
-            "chat_id": self.chat_id,
-            "text": _limit_message(text),
-            "disable_web_page_preview": True,
-        }
         thread_id = message.get("message_thread_id")
-        if isinstance(thread_id, int):
-            payload["message_thread_id"] = thread_id
-        elif config.TELEGRAM_MESSAGE_THREAD_ID:
-            try:
-                payload["message_thread_id"] = int(config.TELEGRAM_MESSAGE_THREAD_ID)
-            except ValueError:
-                log.warning("Invalid WETHR_TELEGRAM_MESSAGE_THREAD_ID; replying without it")
-
-        try:
-            response = await client.post(
-                f"{self._api_base}/sendMessage", json=payload, timeout=10
-            )
-            response.raise_for_status()
-            body = response.json()
-            if not body.get("ok", False):
-                raise RuntimeError(f"Telegram rejected sendMessage: {body!r}")
-        except Exception as exc:
-            log.warning("Telegram command reply failed: %s", exc)
-            return False
-        return True
+        return await send_message(
+            client,
+            _limit_message(text),
+            token=self.token,
+            chat_id=self.chat_id,
+            thread_id=thread_id if isinstance(thread_id, int) else None,
+        )
 
     async def handle_update(self, client: Any, update: dict[str, Any]) -> bool:
         """Handle one update; false means leave it queued for a later retry."""
@@ -231,7 +208,7 @@ class TelegramCommandBot:
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
-                    log.warning("Telegram polling failed: %s", exc)
+                    log.warning("Telegram polling failed: %s", _failure_detail(exc))
                     await asyncio.sleep(5)
 
 

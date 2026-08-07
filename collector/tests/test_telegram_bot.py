@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import sys
 from pathlib import Path
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -175,3 +178,26 @@ def test_failed_reply_leaves_update_unacknowledged_for_retry(tmp_path: Path):
 
     assert asyncio.run(bot.poll_once(client)) == 0
     assert bot.get_offset() is None
+
+
+def test_failed_reply_does_not_log_bot_token(tmp_path: Path, caplog):
+    db_path = make_db(tmp_path)
+    token = "12345:SECRETTOKEN"
+    request = httpx.Request(
+        "POST", f"https://api.telegram.org/bot{token}/sendMessage"
+    )
+    response = httpx.Response(404, request=request)
+    error = httpx.HTTPStatusError(
+        "not found", request=request, response=response
+    )
+    bot = TelegramCommandBot(token, "123", db_path=db_path)
+    client = FakeClient(
+        [{"update_id": 10, "message": {"chat": {"id": 123}, "text": "/pnl"}}],
+        send_error=error,
+    )
+
+    with caplog.at_level(logging.WARNING):
+        assert asyncio.run(bot.poll_once(client)) == 0
+
+    assert token not in caplog.text
+    assert "HTTP 404" in caplog.text
