@@ -136,11 +136,19 @@ All settings in `src/config.py`, overridable via `WETHR_` environment variables:
 | `WETHR_DAILY_LOSS` | 300.0 | Daily loss circuit breaker |
 | `WETHR_SCAN_INTERVAL` | 600 | Seconds between scans (10 minutes) |
 | `WETHR_LIVE` | 0 | Set to 1 for live trading |
-| `WETHR_TELEGRAM_BOT_TOKEN` | unset | Telegram bot token for alerts and read-only commands |
-| `WETHR_TELEGRAM_CHAT_ID` | unset | Authorized Telegram chat ID for alerts and commands |
+| `WETHR_NTFY_TOPIC_URL` | unset | ntfy topic URL for new-position push alerts, e.g. `https://ntfy.sh/<topic>` |
+| `WETHR_TELEGRAM_BOT_TOKEN` | unset | Telegram bot token for the read-only command bot |
+| `WETHR_TELEGRAM_CHAT_ID` | unset | Authorized Telegram chat ID for the read-only command bot |
 | `WETHR_TELEGRAM_MESSAGE_THREAD_ID` | unset | Optional topic/thread ID for forum chats |
 
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are also accepted as aliases.
+
+## Push alerts
+
+New-position alerts push to the ntfy topic configured in `WETHR_NTFY_TOPIC_URL`
+(see `src/ntfy.py`). ntfy topics need no credential — anyone who knows the
+topic name can subscribe, so pick a long, random one and subscribe to it in
+the ntfy app. If the variable is unset, alerts are skipped silently.
 
 ## Telegram commands
 
@@ -160,7 +168,7 @@ systemctl --user enable --now wethr-telegram.service
 
 Do not configure a Telegram webhook or a second polling process for the same
 bot; Telegram updates have one consumer. Stopping the service is sufficient to
-disable command handling and does not affect trade alerts.
+disable command handling and does not affect ntfy push alerts.
 
 ## Live trading
 

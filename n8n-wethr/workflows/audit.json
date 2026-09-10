@@ -186,7 +186,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const items = $input.all();\nconst runDate = new Date().toISOString().split('T')[0];\n\nlet totalPnl = 0;\nlet wins = 0;\nlet losses = 0;\nlet totalTrades = 0;\nlet flips_om = 0;\nlet flips_iem = 0;\nconst cityResults = [];\n\nfor (const item of items) {\n  const d = item.json;\n  for (const t of d.trade_details) {\n    totalTrades++;\n    const pnl = t.pnl || 0;\n    totalPnl += pnl;\n    if (pnl > 0) wins++;\n    else if (pnl < 0) losses++;\n    if (t.om_flipped) flips_om++;\n    if (t.iem_flipped) flips_iem++;\n  }\n  \n  const pnlSum = d.trade_details.reduce((s, t) => s + (t.pnl || 0), 0);\n  const emoji = pnlSum >= 0 ? '\\u2705' : '\\u274c';\n  cityResults.push(\n    `${emoji} ${d.city}: $${pnlSum.toFixed(2)} (${d.n_trades} trade${d.n_trades > 1 ? 's' : ''})`\n    + (d.om_iem_divergence != null ? ` | OM-IEM: ${d.om_iem_divergence > 0 ? '+' : ''}${d.om_iem_divergence}\\u00b0` : '')\n  );\n}\n\nconst winRate = totalTrades > 0 ? ((wins / totalTrades) * 100).toFixed(0) : 0;\nconst pnlEmoji = totalPnl >= 0 ? '\\ud83d\\udcc8' : '\\ud83d\\udcc9';\n\nlet msg = `${pnlEmoji} *Wethr Divergence Audit*\\n`;\nmsg += `\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\n`;\nmsg += `*Date:* ${runDate}\\n`;\nmsg += `*Trades:* ${totalTrades} | *W/L:* ${wins}/${losses} (${winRate}%)\\n`;\nmsg += `*Net PnL:* $${totalPnl.toFixed(2)}\\n\\n`;\n\nif (flips_om > 0 || flips_iem > 0) {\n  msg += `\\u26a0\\ufe0f *Bracket Flips:* OM=${flips_om}, IEM=${flips_iem}\\n\\n`;\n}\n\nmsg += `*By City:*\\n`;\nmsg += cityResults.join('\\n');\n\nreturn [{ json: { message: msg } }];"
+        "jsCode": "const items = $input.all();\nconst runDate = new Date().toISOString().split('T')[0];\n\nlet totalPnl = 0;\nlet wins = 0;\nlet losses = 0;\nlet totalTrades = 0;\nlet flips_om = 0;\nlet flips_iem = 0;\nconst cityResults = [];\n\nfor (const item of items) {\n  const d = item.json;\n  for (const t of d.trade_details) {\n    totalTrades++;\n    const pnl = t.pnl || 0;\n    totalPnl += pnl;\n    if (pnl > 0) wins++;\n    else if (pnl < 0) losses++;\n    if (t.om_flipped) flips_om++;\n    if (t.iem_flipped) flips_iem++;\n  }\n  \n  const pnlSum = d.trade_details.reduce((s, t) => s + (t.pnl || 0), 0);\n  const emoji = pnlSum >= 0 ? '\\u2705' : '\\u274c';\n  cityResults.push(\n    `${emoji} ${d.city}: $${pnlSum.toFixed(2)} (${d.n_trades} trade${d.n_trades > 1 ? 's' : ''})`\n    + (d.om_iem_divergence != null ? ` | OM-IEM: ${d.om_iem_divergence > 0 ? '+' : ''}${d.om_iem_divergence}\\u00b0` : '')\n  );\n}\n\nconst winRate = totalTrades > 0 ? ((wins / totalTrades) * 100).toFixed(0) : 0;\nconst pnlEmoji = totalPnl >= 0 ? '\\ud83d\\udcc8' : '\\ud83d\\udcc9';\n\nlet msg = `${pnlEmoji} **Wethr Divergence Audit**\\n`;\nmsg += `\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\u2500\\n`;\nmsg += `**Date:** ${runDate}\\n`;\nmsg += `**Trades:** ${totalTrades} | **W/L:** ${wins}/${losses} (${winRate}%)\\n`;\nmsg += `**Net PnL:** $${totalPnl.toFixed(2)}\\n\\n`;\n\nif (flips_om > 0 || flips_iem > 0) {\n  msg += `\\u26a0\\ufe0f **Bracket Flips:** OM=${flips_om}, IEM=${flips_iem}\\n\\n`;\n}\n\nmsg += `**By City:**\\n`;\nmsg += cityResults.join('\\n');\n\nreturn [{ json: { message: msg } }];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -199,26 +199,42 @@
     },
     {
       "parameters": {
-        "chatId": "8670810799",
-        "text": "={{ $json.message }}",
-        "additionalFields": {
-          "parse_mode": "Markdown"
+        "method": "POST",
+        "url": "https://ntfy.sh/wethr-u1bh8d93bt7udb7yf6wx",
+        "sendBody": true,
+        "specifyBody": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json.message }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Title",
+              "value": "Wethr Divergence Audit"
+            },
+            {
+              "name": "Priority",
+              "value": "default"
+            },
+            {
+              "name": "Tags",
+              "value": "chart_with_upwards_trend"
+            },
+            {
+              "name": "Markdown",
+              "value": "yes"
+            }
+          ]
         }
       },
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.2,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
       "position": [
         1892,
         400
       ],
       "id": "a1b2c3d4-e5f6-7890-abcd-telegram0001",
-      "name": "Send Telegram Summary",
-      "credentials": {
-        "telegramApi": {
-          "id": "tg_wethr_bot_001",
-          "name": "Telegram Wethr Bot"
-        }
-      }
+      "name": "Send ntfy Summary"
     },
     {
       "parameters": {
@@ -253,26 +269,42 @@
     },
     {
       "parameters": {
-        "chatId": "8670810799",
-        "text": "\u26a0\ufe0f *Wethr Divergence Audit*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\nNo trades were settled within the current export window.\nThis does not report collector scans or new positions; check collector status separately.",
-        "additionalFields": {
-          "parse_mode": "Markdown"
+        "method": "POST",
+        "url": "https://ntfy.sh/wethr-u1bh8d93bt7udb7yf6wx",
+        "sendBody": true,
+        "specifyBody": "raw",
+        "rawContentType": "text/plain",
+        "body": "\u26a0\ufe0f **Wethr Divergence Audit**\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\nNo trades were settled within the current export window.\nThis does not report collector scans or new positions; check collector status separately.",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Title",
+              "value": "Wethr Divergence Audit"
+            },
+            {
+              "name": "Priority",
+              "value": "default"
+            },
+            {
+              "name": "Tags",
+              "value": "warning"
+            },
+            {
+              "name": "Markdown",
+              "value": "yes"
+            }
+          ]
         }
       },
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.2,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
       "position": [
         780,
         250
       ],
       "id": "guard-empty-alert-0001",
-      "name": "Alert No Trades",
-      "credentials": {
-        "telegramApi": {
-          "id": "tg_wethr_bot_001",
-          "name": "Telegram Wethr Bot"
-        }
-      }
+      "name": "Alert No Trades"
     },
     {
       "parameters": {
@@ -477,7 +509,7 @@
       "main": [
         [
           {
-            "node": "Send Telegram Summary",
+            "node": "Send ntfy Summary",
             "type": "main",
             "index": 0
           }
@@ -561,7 +593,7 @@
         ]
       ]
     },
-    "Send Telegram Summary": {
+    "Send ntfy Summary": {
       "main": [
         [
           {

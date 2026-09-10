@@ -231,7 +231,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const items = $input.all();\nconst tradeData = $('Build Trade CSV').first().json;\nconst dailyData = $('Build Daily CSV').first().json;\n\nconst msg = `\u2705 *Backfill Complete*\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n*Trades:* ${tradeData.totalTrades} rows \u2192 backfill_trades.csv\n*Daily:*  ${dailyData.totalDays} city-dates \u2192 backfill_daily.csv\n\nFiles saved to /data/wethr/`;\n\nreturn [{ json: { message: msg } }];"
+        "jsCode": "const items = $input.all();\nconst tradeData = $('Build Trade CSV').first().json;\nconst dailyData = $('Build Daily CSV').first().json;\n\nconst msg = `\u2705 **Backfill Complete**\n\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\n**Trades:** ${tradeData.totalTrades} rows \u2192 backfill_trades.csv\n**Daily:**  ${dailyData.totalDays} city-dates \u2192 backfill_daily.csv\n\nFiles saved to /data/wethr/`;\n\nreturn [{ json: { message: msg } }];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -244,26 +244,42 @@
     },
     {
       "parameters": {
-        "chatId": "8670810799",
-        "text": "={{ $json.message }}",
-        "additionalFields": {
-          "parse_mode": "Markdown"
+        "method": "POST",
+        "url": "https://ntfy.sh/wethr-u1bh8d93bt7udb7yf6wx",
+        "sendBody": true,
+        "specifyBody": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json.message }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Title",
+              "value": "Wethr Backfill"
+            },
+            {
+              "name": "Priority",
+              "value": "low"
+            },
+            {
+              "name": "Tags",
+              "value": "white_check_mark"
+            },
+            {
+              "name": "Markdown",
+              "value": "yes"
+            }
+          ]
         }
       },
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.2,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
       "position": [
         1792,
         300
       ],
       "id": "bf-tg-0001",
-      "name": "Notify Complete",
-      "credentials": {
-        "telegramApi": {
-          "id": "tg_wethr_bot_001",
-          "name": "Telegram Wethr Bot"
-        }
-      }
+      "name": "Notify Complete"
     }
   ],
   "connections": {

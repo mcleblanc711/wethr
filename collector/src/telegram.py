@@ -1,26 +1,21 @@
 """
-Telegram notifications for Wethr trading events.
+Telegram Bot API helper for the read-only Wethr command bot.
 
-Notifications are optional. If Telegram credentials are not configured, calls
-are no-ops. Failures are logged but never raised into the trading pipeline.
+Outbound trade/audit push notifications live in ``ntfy.py``; this module
+exists only to send replies for the ``/positions /pnl /status`` command bot
+in ``telegram_bot.py``, which needs interactive Telegram commands that ntfy
+cannot serve.
 """
 from __future__ import annotations
 
 import logging
-from datetime import date
 from typing import Any
 
 import httpx
 
 from . import config
-from .sizing import PositionSize
 
 log = logging.getLogger(__name__)
-
-
-def is_configured() -> bool:
-    """Return True when the Telegram Bot API can be called."""
-    return bool(config.TELEGRAM_BOT_TOKEN and config.TELEGRAM_CHAT_ID)
 
 
 def _failure_detail(exc: Exception) -> str:
@@ -48,39 +43,6 @@ async def _post_telegram(
         log.warning("Telegram message failed: %s", _failure_detail(exc))
         return False
     return True
-
-
-def build_trade_opened_message(
-    trade_id: int,
-    city: str,
-    target_date: date,
-    ps: PositionSize,
-    market_volume: float = 0.0,
-    pending_count: int | None = None,
-) -> str:
-    """Build the Telegram text for a newly opened position."""
-    bp = ps.bracket_prob
-    bracket = bp.bracket
-    city_name = config.CITIES.get(city).name if city in config.CITIES else city
-
-    lines = [
-        "New Wethr position",
-        f"#{trade_id} {city_name} {target_date.isoformat()}",
-        f"{bracket.label} {ps.side} @ {ps.entry_price:.2f}",
-        f"Size: ${ps.capped_size_usd:.2f}",
-        (
-            f"Edge: {bp.edge:+.1%} "
-            f"(model {bp.model_prob:.1%}, market {bp.market_prob:.1%})"
-        ),
-        f"Win/Loss: ${ps.win_pnl:+.2f} / ${ps.loss_pnl:+.2f}",
-    ]
-
-    if market_volume > 0:
-        lines.append(f"Market volume: ${market_volume:,.0f}")
-    if pending_count is not None:
-        lines.append(f"Open positions: {pending_count}")
-
-    return "\n".join(lines)
 
 
 async def send_message(
@@ -120,24 +82,3 @@ async def send_message(
             )
 
     return await _post_telegram(client, token=token, payload=payload)
-
-
-async def notify_trade_opened(
-    client: Any,
-    trade_id: int,
-    city: str,
-    target_date: date,
-    ps: PositionSize,
-    market_volume: float = 0.0,
-    pending_count: int | None = None,
-) -> bool:
-    """Notify Telegram that a new position was opened."""
-    message = build_trade_opened_message(
-        trade_id=trade_id,
-        city=city,
-        target_date=target_date,
-        ps=ps,
-        market_volume=market_volume,
-        pending_count=pending_count,
-    )
-    return await send_message(client, message)

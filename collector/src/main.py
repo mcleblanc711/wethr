@@ -37,7 +37,7 @@ from .paper_trader import (
     print_report,
 )
 from .settlement import settle_date, settle_yesterday
-from .telegram import notify_trade_opened
+from .ntfy import notify_trade_opened
 from .trading import TradingClient
 from .calibration_cli import add_calibration_commands, dispatch_calibration_command
 from .calibration_ops import (

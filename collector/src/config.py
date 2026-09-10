@@ -228,3 +228,9 @@ TELEGRAM_CHAT_ID = (
     or os.getenv("TELEGRAM_CHAT_ID", "")
 )
 TELEGRAM_MESSAGE_THREAD_ID = os.getenv("WETHR_TELEGRAM_MESSAGE_THREAD_ID", "")
+# TELEGRAM_* above is used only by the read-only /telegram-bot command bot.
+
+# ---------------------------------------------------------------------------
+# ntfy.sh notifications
+# ---------------------------------------------------------------------------
+NTFY_TOPIC_URL = os.getenv("WETHR_NTFY_TOPIC_URL", "")

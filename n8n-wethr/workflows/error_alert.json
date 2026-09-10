@@ -15,7 +15,7 @@
     },
     {
       "parameters": {
-        "jsCode": "const execution = $json;\n\nconst wfName = execution.workflow?.name || 'Unknown workflow';\nconst wfId = execution.workflow?.id || '?';\nconst errorMsg = execution.execution?.error?.message || 'No error message';\nconst ts = new Date().toISOString().replace('T', ' ').split('.')[0];\n\nlet msg = `\ud83d\udea8 *Workflow Error*\\n`;\nmsg += `\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\\n`;\nmsg += `*Workflow:* ${wfName}\\n`;\nmsg += `*Time:* ${ts} UTC\\n`;\nmsg += `*Error:* ${errorMsg}\\n\\n`;\nmsg += `[View in n8n](http://localhost:5678/workflow/${wfId}/executions)`;\n\nreturn [{ json: { message: msg } }];"
+        "jsCode": "const execution = $json;\n\nconst wfName = execution.workflow?.name || 'Unknown workflow';\nconst wfId = execution.workflow?.id || '?';\nconst errorMsg = execution.execution?.error?.message || 'No error message';\nconst ts = new Date().toISOString().replace('T', ' ').split('.')[0];\n\nlet msg = `\ud83d\udea8 **Workflow Error**\\n`;\nmsg += `\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\u2501\\n`;\nmsg += `**Workflow:** ${wfName}\\n`;\nmsg += `**Time:** ${ts} UTC\\n`;\nmsg += `**Error:** ${errorMsg}\\n\\n`;\nmsg += `[View in n8n](http://localhost:5678/workflow/${wfId}/executions)`;\n\nreturn [{ json: { message: msg } }];"
       },
       "type": "n8n-nodes-base.code",
       "typeVersion": 2,
@@ -28,26 +28,42 @@
     },
     {
       "parameters": {
-        "chatId": "8670810799",
-        "text": "={{ $json.message }}",
-        "additionalFields": {
-          "parse_mode": "Markdown"
+        "method": "POST",
+        "url": "https://ntfy.sh/wethr-u1bh8d93bt7udb7yf6wx",
+        "sendBody": true,
+        "specifyBody": "raw",
+        "rawContentType": "text/plain",
+        "body": "={{ $json.message }}",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Title",
+              "value": "Wethr Workflow Error"
+            },
+            {
+              "name": "Priority",
+              "value": "high"
+            },
+            {
+              "name": "Tags",
+              "value": "rotating_light"
+            },
+            {
+              "name": "Markdown",
+              "value": "yes"
+            }
+          ]
         }
       },
-      "type": "n8n-nodes-base.telegram",
-      "typeVersion": 1.2,
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
       "position": [
         448,
         0
       ],
       "id": "err-telegram-0001",
-      "name": "Send Error Alert",
-      "credentials": {
-        "telegramApi": {
-          "id": "tg_wethr_bot_001",
-          "name": "Telegram Wethr Bot"
-        }
-      }
+      "name": "Send Error Alert"
     }
   ],
   "connections": {
