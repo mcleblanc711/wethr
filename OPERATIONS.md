@@ -40,6 +40,32 @@ systemctl --user status wethr-collector.service
 journalctl --user -u wethr-collector.service -f
 ```
 
+## Push alerts
+
+New-position alerts push to the ntfy topic in `WETHR_NTFY_TOPIC_URL` (see
+`collector/src/ntfy.py`). Set it through a user systemd drop-in or secret
+environment file for `wethr-collector.service` and subscribe to the same
+topic in the ntfy app; unset, alerts are skipped silently.
+
+## Telegram command bot
+
+ntfy is push-only. To add read-only commands from a
+configured Telegram chat (`/positions`, `/pnl`, `/status`, `/help`), install the
+separate long-polling service after supplying `WETHR_TELEGRAM_BOT_TOKEN` and
+`WETHR_TELEGRAM_CHAT_ID` through a user systemd drop-in or secret environment
+file:
+
+```bash
+cp ~/projects/wethr/deploy/systemd/wethr-telegram.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+systemctl --user enable --now wethr-telegram.service
+```
+
+The service is deliberately read-only and ignores messages from every other
+chat. It must be the only webhook/polling consumer for that bot. Enabling it is
+an operational action; this repository change does not configure credentials or
+start the service.
+
 ## n8n Audit
 
 The audit reads `n8n-wethr/wethr-output/settled_trades.json` as
@@ -63,7 +89,7 @@ systemctl --user enable --now wethr-export.timer
 The checked-in audit workflow polls hourly but its `Audit Due?` gate permits
 only one production run per Edmonton calendar day after 09:00. This catches up
 after a host/container restart that missed 09:00 without sending hourly
-Telegram summaries. `python3 run.py doctor` compares the audit ledger with the
+ntfy summaries. `python3 run.py doctor` compares the audit ledger with the
 most recent expected 09:00 run; a running container alone is not audit health.
 
 Workflow JSON is source control, not automatic deployment. After changing

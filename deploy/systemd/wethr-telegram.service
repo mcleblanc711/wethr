@@ -1,0 +1,20 @@
+[Unit]
+Description=Wethr read-only Telegram command bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/wethr/collector
+Environment=WETHR_LIVE=0
+# Required: configure these in a user systemd drop-in or secret environment file.
+# Environment=WETHR_TELEGRAM_BOT_TOKEN=
+# Environment=WETHR_TELEGRAM_CHAT_ID=
+# Optional for Telegram forum chats.
+# Environment=WETHR_TELEGRAM_MESSAGE_THREAD_ID=
+ExecStart=/usr/bin/python3 %h/projects/wethr/collector/run.py telegram-bot
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

@@ -46,7 +46,7 @@ from src.probability import count_members_in_bracket, BracketProbability
 from src.sizing import calculate_kelly, size_position
 from src.ensemble import c_to_f, EnsembleMember, EnsembleForecast
 from src.paper_trader import init_db, record_paper_trade, settle_trade, get_stats, get_calibration_data
-from src.telegram import build_trade_opened_message
+from src.ntfy import build_trade_opened_message
 
 
 # ===================================================================
@@ -723,8 +723,8 @@ def test_bracket_has_no_token_field():
     assert b.token_id == "yes123"
 
 
-def test_trade_opened_telegram_message():
-    """New-position Telegram messages should show the trade details."""
+def test_trade_opened_ntfy_message():
+    """New-position ntfy messages should show the trade details."""
     from src.markets import Bracket
 
     bracket = Bracket(

@@ -516,6 +516,7 @@ class TradingStats:
     losses: int = 0
     win_rate: float = 0.0
     gross_pnl: float = 0.0
+    settled_stake: float = 0.0
     avg_pnl: float = 0.0
     avg_edge: float = 0.0
     brier_score: float | None = None
@@ -547,10 +548,12 @@ def get_stats(db_path: Path | None = None) -> TradingStats:
             stats.win_rate = stats.wins / stats.settled_trades
 
             row = conn.execute(
-                "SELECT SUM(pnl) as total, AVG(pnl) as avg_pnl, AVG(edge) as avg_edge "
+                "SELECT SUM(pnl) as total, SUM(size_usd) as settled_stake, "
+                "AVG(pnl) as avg_pnl, AVG(edge) as avg_edge "
                 "FROM trades WHERE settled = 1"
             ).fetchone()
             stats.gross_pnl = row["total"] or 0.0
+            stats.settled_stake = row["settled_stake"] or 0.0
             stats.avg_pnl = row["avg_pnl"] or 0.0
             stats.avg_edge = row["avg_edge"] or 0.0
 

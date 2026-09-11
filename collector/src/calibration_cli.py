@@ -22,7 +22,7 @@ from .calibration_ops import (
     rollback_model,
     train_candidate,
 )
-from .telegram import send_message
+from .ntfy import send_message
 
 COMMANDS = {
     "collect-status", "backfill", "reconcile", "train-candidate", "evaluate",
@@ -86,7 +86,11 @@ def dispatch_calibration_command(args: argparse.Namespace) -> bool:
         gates = promote_model(args.model_version)
         async def notify() -> None:
             async with httpx.AsyncClient(headers={"User-Agent": config.USER_AGENT}) as client:
-                await send_message(client, f"Wethr paper model promoted: {args.model_version}\nLive trading remains disabled.")
+                await send_message(
+                    client,
+                    f"Wethr paper model promoted: {args.model_version}\nLive trading remains disabled.",
+                    title="Wethr Model Promoted",
+                )
         asyncio.run(notify())
         print(json.dumps({"promoted": args.model_version, "gates": gates, "live_trading": False}, indent=2))
     elif args.command == "rollback":
