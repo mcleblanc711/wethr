@@ -7,4 +7,6 @@ Wants=network-online.target
 Type=oneshot
 WorkingDirectory=%h/projects/wethr/collector
 Environment=WETHR_LIVE=0
+# Optional: send calibration alerts to ntfy.
+# Environment=WETHR_NTFY_TOPIC_URL=
 ExecStart=%h/projects/wethr/collector/.venv/bin/python -m scripts.daily_calibration

@@ -20,6 +20,7 @@ from src.telegram_bot import (
     format_pnl,
     format_positions,
     format_status,
+    format_today,
 )
 
 
@@ -201,3 +202,110 @@ def test_failed_reply_does_not_log_bot_token(tmp_path: Path, caplog):
 
     assert token not in caplog.text
     assert "HTTP 404" in caplog.text
+
+
+def make_audit_db(tmp_path: Path) -> Path:
+    audit_path = tmp_path / "wethr_audit.db"
+    conn = sqlite3.connect(audit_path)
+    conn.executescript(
+        """
+        CREATE TABLE audit_runs (
+            run_id TEXT, started_at TEXT, finished_at TEXT, status TEXT,
+            trigger_type TEXT, workflow_id TEXT, daily_rows_upserted INTEGER,
+            trade_rows_upserted INTEGER, n_trades_input INTEGER,
+            error_message TEXT, notes TEXT
+        );
+        CREATE TABLE divergences_trades (
+            trade_id TEXT, wu_temp REAL, om_temp REAL, iem_temp REAL,
+            om_flipped INTEGER, iem_flipped INTEGER
+        );
+        INSERT INTO audit_runs VALUES
+            ('1', '2026-09-13T15:00:00Z', '2026-09-13T15:01:00Z', 'completed',
+             'production', 'wf', 5, 5, 5, NULL, NULL),
+            ('2', '2026-09-14T15:00:00Z', NULL, 'running', 'production', 'wf',
+             0, 0, 12, NULL, NULL);
+        INSERT INTO divergences_trades VALUES ('1', 73, 75.2, 74, 1, 0);
+        """
+    )
+    conn.commit()
+    conn.close()
+    return audit_path
+
+
+def test_settled_lists_recent_trades_with_window_total(tmp_path: Path):
+    db_path = make_db(tmp_path)
+    insert_trade(db_path, trade_id=1, settled=1, pnl=12.5)
+    insert_trade(db_path, trade_id=2, settled=1, pnl=-25.0)
+    insert_trade(db_path, trade_id=3)
+
+    message = command_response("/settled", db_path)
+
+    assert "Last 2 settled trade(s)" in message
+    assert "✅ #1 nyc 2026-08-07" in message
+    assert "❌ #2 nyc 2026-08-07" in message
+    assert "#3" not in message
+    assert "Window P/L: $-12.50" in message
+    assert "Last 1 settled" in command_response("/settled 1", db_path)
+    assert command_response("/settled lots", db_path).startswith("Usage:")
+
+
+def test_trade_detail_includes_audit_divergence(tmp_path: Path):
+    db_path = make_db(tmp_path)
+    audit_path = make_audit_db(tmp_path)
+    insert_trade(db_path, trade_id=1, settled=1, pnl=12.5)
+    insert_trade(db_path, trade_id=2)
+
+    audited = command_response("/trade 1", db_path, audit_path)
+    open_trade = command_response("/trade #2", db_path, tmp_path / "missing.db")
+
+    assert "Trade #1 nyc 2026-08-07" in audited
+    assert "Result: ✅ P/L $+12.50" in audited
+    assert "Audit: WU 73.0° · OM 75.2° · IEM 74.0°" in audited
+    assert "Bracket flipped under: OM" in audited
+    assert "Status: open" in open_trade
+    assert "Audit" not in open_trade
+    assert command_response("/trade 99", db_path, audit_path) == "Trade #99 not found."
+    assert command_response("/trade abc", db_path) == "Usage: /trade <id>"
+
+
+def test_today_counts_opened_and_settled(tmp_path: Path):
+    db_path = make_db(tmp_path)
+    insert_trade(db_path, trade_id=1, settled=1, pnl=12.5)
+    insert_trade(db_path, trade_id=2)
+
+    opened_day = format_today(db_path, today="2026-08-06")
+    settled_day = format_today(db_path, today="2026-08-08")
+
+    assert "Opened: 2 ($50.00 staked)" in opened_day
+    assert "Settled: 0 (0W / 0L)" in opened_day
+    assert "Settled: 1 (1W / 0L)" in settled_day
+    assert "Settled P/L: $+12.50" in settled_day
+
+
+def test_audit_reports_latest_run_or_missing_ledger(tmp_path: Path):
+    db_path = make_db(tmp_path)
+    audit_path = make_audit_db(tmp_path)
+
+    latest = command_response("/audit", db_path, audit_path)
+
+    assert "Status: running (production)" in latest
+    assert "Finished: not finished" in latest
+    assert "Trades audited: 12" in latest
+    assert command_response("/audit", db_path, tmp_path / "none.db") == (
+        "No n8n audit ledger found."
+    )
+
+
+def test_mute_commands_toggle_ntfy_categories(tmp_path: Path):
+    db_path = make_db(tmp_path)
+
+    muted = command_response("/mute settlements", db_path)
+    all_muted = command_response("/mute all", db_path)
+    unmuted = command_response("/unmute positions", db_path)
+
+    assert "settlements: muted" in muted and "positions: on" in muted
+    assert "positions: muted" in all_muted and "calibration: muted" in all_muted
+    assert "positions: on" in unmuted and "settlements: muted" in unmuted
+    assert "settlements: muted" in command_response("/mutes", db_path)
+    assert command_response("/mute bogus", db_path).startswith("Usage: /mute")
+    assert command_response("/unmute", db_path).startswith("Usage: /unmute")

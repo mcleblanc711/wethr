@@ -136,26 +136,52 @@ All settings in `src/config.py`, overridable via `WETHR_` environment variables:
 | `WETHR_DAILY_LOSS` | 300.0 | Daily loss circuit breaker |
 | `WETHR_SCAN_INTERVAL` | 600 | Seconds between scans (10 minutes) |
 | `WETHR_LIVE` | 0 | Set to 1 for live trading |
-| `WETHR_NTFY_TOPIC_URL` | unset | ntfy topic URL for new-position push alerts, e.g. `https://ntfy.sh/<topic>` |
-| `WETHR_TELEGRAM_BOT_TOKEN` | unset | Telegram bot token for the read-only command bot |
-| `WETHR_TELEGRAM_CHAT_ID` | unset | Authorized Telegram chat ID for the read-only command bot |
+| `WETHR_NTFY_TOPIC_URL` | unset | ntfy topic URL for position, settlement, and calibration push alerts, e.g. `https://ntfy.sh/<topic>` |
+| `WETHR_TELEGRAM_BOT_TOKEN` | unset | Telegram bot token for the command bot |
+| `WETHR_TELEGRAM_CHAT_ID` | unset | Authorized Telegram chat ID for the command bot |
 | `WETHR_TELEGRAM_MESSAGE_THREAD_ID` | unset | Optional topic/thread ID for forum chats |
 
 `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are also accepted as aliases.
 
 ## Push alerts
 
-New-position alerts push to the ntfy topic configured in `WETHR_NTFY_TOPIC_URL`
-(see `src/ntfy.py`). ntfy topics need no credential — anyone who knows the
-topic name can subscribe, so pick a long, random one and subscribe to it in
-the ntfy app. If the variable is unset, alerts are skipped silently.
+The collector pushes to the ntfy topic configured in `WETHR_NTFY_TOPIC_URL`
+(see `src/ntfy.py`):
+
+- `positions`: one push per newly opened paper position.
+- `settlements`: one push per settled trade (WIN/LOSS, P/L, lifetime P/L),
+  from the loop's daily settlement cycle and from `run.py settle`.
+- `calibration`: daily/monthly calibration alerts and model promotions. Set
+  `WETHR_NTFY_TOPIC_URL` on the calibration units too.
+
+ntfy topics need no credential — anyone who knows the topic name can
+subscribe, so pick a long, random one and subscribe to it in the ntfy app. If
+the variable is unset, alerts are skipped silently. Each category can be muted
+from Telegram (`/mute`); the flag lives in the ledger `settings` table and is
+read on every push. The n8n audit, backfill, and error pushes are sent by n8n
+directly and are not affected by these mutes.
+
+The running collector only picks up notification code changes after
+`systemctl --user restart wethr-collector.service`.
 
 ## Telegram commands
 
 The optional `wethr-telegram.service` runs one local long-polling consumer for
-the configured bot. It accepts commands only from `WETHR_TELEGRAM_CHAT_ID` and
-is read-only: `/positions`, `/pnl`, `/status`, and `/help`. `/status` reports
-ledger timestamps, not a claim that the collector service is healthy.
+the configured bot. It accepts commands only from `WETHR_TELEGRAM_CHAT_ID`:
+
+| Command | Reply |
+|---------|-------|
+| `/positions` | Open paper positions |
+| `/pnl` | Lifetime realized P/L, ROI, W/L |
+| `/settled [n]` | Last n settled trades (default 10, max 20) and their total |
+| `/trade <id>` | One trade in detail, plus its n8n divergence row when audited |
+| `/today` | Positions opened and settled today (UTC) |
+| `/audit` | Latest n8n divergence audit run |
+| `/status` | Ledger timestamps (not a collector health check) |
+| `/mutes`, `/mute <cat\|all>`, `/unmute <cat\|all>` | Show or toggle ntfy categories `positions`, `settlements`, `calibration` |
+
+Commands never modify trades; `/mute` and `/unmute` only write ntfy flags in
+the `settings` table.
 
 Install it only after configuring the token and authorized chat ID in a user
 systemd drop-in or secret environment file:

@@ -90,6 +90,7 @@ def dispatch_calibration_command(args: argparse.Namespace) -> bool:
                     client,
                     f"Wethr paper model promoted: {args.model_version}\nLive trading remains disabled.",
                     title="Wethr Model Promoted",
+                    category="calibration",
                 )
         asyncio.run(notify())
         print(json.dumps({"promoted": args.model_version, "gates": gates, "live_trading": False}, indent=2))

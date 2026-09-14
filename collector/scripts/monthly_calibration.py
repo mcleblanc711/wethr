@@ -10,7 +10,7 @@ import httpx
 from src import config
 from src.calibration_ops import LEAD_BUCKETS, archive_month, train_candidate
 from src.paper_trader import init_db
-from src.telegram import send_message
+from src.ntfy import send_message
 
 
 def run() -> None:
@@ -28,6 +28,12 @@ if __name__ == "__main__":
     except Exception as exc:
         async def alert() -> None:
             async with httpx.AsyncClient(headers={"User-Agent": config.USER_AGENT}) as client:
-                await send_message(client, f"Wethr monthly archive/model job failed: {exc}")
+                await send_message(
+                    client,
+                    f"Wethr monthly archive/model job failed: {exc}",
+                    title="Wethr Monthly Job Failed",
+                    tags="rotating_light",
+                    category="calibration",
+                )
         asyncio.run(alert())
         raise

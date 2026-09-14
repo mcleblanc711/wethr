@@ -7,7 +7,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/projects/wethr/collector
 Environment=WETHR_LIVE=0
-# Optional: send new-position alerts to ntfy.
+# Optional: send new-position and settlement alerts to ntfy.
 # Environment=WETHR_NTFY_TOPIC_URL=
 ExecStart=/usr/bin/python3 %h/projects/wethr/collector/run.py loop
 Restart=always

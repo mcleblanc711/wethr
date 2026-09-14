@@ -201,6 +201,33 @@ def extract_outcomes_by_label(event: dict) -> dict[str, bool]:
 # Settlement pipeline (Gamma-first, NWS/Open-Meteo fallback)
 # ---------------------------------------------------------------------------
 
+def _record_settled_trade(
+    summary: dict,
+    trade: sqlite3.Row,
+    outcome: bool,
+    db_path: Path | None,
+) -> None:
+    """Settle one trade and add its result to the settle_date summary."""
+    pnl = settle_trade(trade["id"], outcome, db_path)
+    summary["trades_settled"] += 1
+    summary["total_pnl"] += pnl
+    city_summary = summary["cities"].setdefault(trade["city"], {"pnl": 0.0, "trades": 0})
+    city_summary["pnl"] += pnl
+    city_summary["trades"] += 1
+    summary["settled"].append({
+        "id": trade["id"],
+        "city": trade["city"],
+        "target_date": trade["target_date"],
+        "bracket_label": trade["bracket_label"],
+        "side": trade["side"],
+        "entry_price": trade["entry_price"],
+        "size_usd": trade["size_usd"],
+        "edge": trade["edge"],
+        "outcome": outcome,
+        "pnl": pnl,
+    })
+
+
 async def settle_date(
     client: httpx.AsyncClient,
     target_date: date,
@@ -222,6 +249,7 @@ async def settle_date(
         "cities": {},
         "redeemed": 0,
         "redeem_failed": 0,
+        "settled": [],
     }
 
     with get_db(db_path) as conn:
@@ -279,25 +307,15 @@ async def settle_date(
 
         # Try condition_id match first (most reliable)
         if condition_id and condition_id in condition_outcomes:
-            outcome = condition_outcomes[condition_id]
-            pnl = settle_trade(trade["id"], outcome, db_path)
-            summary["trades_settled"] += 1
-            summary["total_pnl"] += pnl
-            city_summary = summary["cities"].setdefault(city, {"pnl": 0.0, "trades": 0})
-            city_summary["pnl"] += pnl
-            city_summary["trades"] += 1
+            _record_settled_trade(summary, trade, condition_outcomes[condition_id], db_path)
             log.info(f"  Trade #{trade['id']} settled via Gamma (condition_id)")
             continue
 
         # Try label match
         if (city, bracket_label) in label_outcomes:
-            outcome = label_outcomes[(city, bracket_label)]
-            pnl = settle_trade(trade["id"], outcome, db_path)
-            summary["trades_settled"] += 1
-            summary["total_pnl"] += pnl
-            city_summary = summary["cities"].setdefault(city, {"pnl": 0.0, "trades": 0})
-            city_summary["pnl"] += pnl
-            city_summary["trades"] += 1
+            _record_settled_trade(
+                summary, trade, label_outcomes[(city, bracket_label)], db_path
+            )
             log.info(f"  Trade #{trade['id']} settled via Gamma (label match)")
             continue
 
