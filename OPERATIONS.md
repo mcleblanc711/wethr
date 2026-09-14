@@ -42,15 +42,24 @@ journalctl --user -u wethr-collector.service -f
 
 ## Push alerts
 
-New-position alerts push to the ntfy topic in `WETHR_NTFY_TOPIC_URL` (see
-`collector/src/ntfy.py`). Set it through a user systemd drop-in or secret
-environment file for `wethr-collector.service` and subscribe to the same
-topic in the ntfy app; unset, alerts are skipped silently.
+New-position and per-trade settlement alerts push to the ntfy topic in
+`WETHR_NTFY_TOPIC_URL` (see `collector/src/ntfy.py`). Set it through a user
+systemd drop-in or secret environment file for `wethr-collector.service` (and
+the calibration units, for calibration alerts) and subscribe to the same topic
+in the ntfy app; unset, alerts are skipped silently. Restart the collector
+after deploying notification changes — a long-running loop keeps the code it
+started with.
+
+Push categories (`positions`, `settlements`, `calibration`) can be muted from
+the Telegram bot. n8n audit, backfill, and error pushes are sent by n8n and
+cannot be muted that way.
 
 ## Telegram command bot
 
-ntfy is push-only. To add read-only commands from a
-configured Telegram chat (`/positions`, `/pnl`, `/status`, `/help`), install the
+ntfy is push-only. To query the ledger from a configured Telegram chat
+(`/positions`, `/pnl`, `/settled`, `/trade <id>`, `/today`, `/audit`,
+`/status`) and mute or unmute ntfy categories (`/mutes`, `/mute`, `/unmute`),
+install the
 separate long-polling service after supplying `WETHR_TELEGRAM_BOT_TOKEN` and
 `WETHR_TELEGRAM_CHAT_ID` through a user systemd drop-in or secret environment
 file:
@@ -61,8 +70,8 @@ systemctl --user daemon-reload
 systemctl --user enable --now wethr-telegram.service
 ```
 
-The service is deliberately read-only and ignores messages from every other
-chat. It must be the only webhook/polling consumer for that bot. Enabling it is
+The service never modifies trades (its only writes are ntfy mute flags) and
+ignores messages from every other chat. It must be the only webhook/polling consumer for that bot. Enabling it is
 an operational action; this repository change does not configure credentials or
 start the service.
 

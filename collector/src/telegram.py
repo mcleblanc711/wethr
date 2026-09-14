@@ -1,8 +1,8 @@
 """
-Telegram Bot API helper for the read-only Wethr command bot.
+Telegram Bot API helper for the Wethr command bot.
 
 Outbound trade/audit push notifications live in ``ntfy.py``; this module
-exists only to send replies for the ``/positions /pnl /status`` command bot
+exists only to send replies for the command bot
 in ``telegram_bot.py``, which needs interactive Telegram commands that ntfy
 cannot serve.
 """

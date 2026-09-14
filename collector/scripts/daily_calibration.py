@@ -13,7 +13,7 @@ from src.calibration_ops import (
     due_resolution_items, reconcile_all,
 )
 from src.paper_trader import init_db
-from src.telegram import send_message
+from src.ntfy import send_message
 
 
 async def run() -> None:
@@ -73,7 +73,13 @@ async def run() -> None:
         )
     if alerts:
         async with httpx.AsyncClient(headers={"User-Agent": config.USER_AGENT}) as client:
-            await send_message(client, "Wethr calibration alert: " + "; ".join(alerts))
+            await send_message(
+                client,
+                "Wethr calibration alert: " + "; ".join(alerts),
+                title="Wethr Calibration Alert",
+                tags="warning",
+                category="calibration",
+            )
     print(json.dumps(totals, indent=2, sort_keys=True))
 
 

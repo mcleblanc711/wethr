@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from datetime import date
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -18,9 +19,54 @@ from .sizing import PositionSize
 log = logging.getLogger(__name__)
 
 
+MUTE_CATEGORIES = ("positions", "settlements", "calibration")
+MUTE_SETTING_PREFIX = "ntfy_mute_"
+
+
 def is_configured() -> bool:
     """Return True when an ntfy topic URL is set."""
     return bool(config.NTFY_TOPIC_URL)
+
+
+def is_muted(category: str, db_path: Path | None = None) -> bool:
+    """
+    Return True when a push category is muted in the ledger settings table.
+
+    Mutes are read on every send so a change from the Telegram bot applies to
+    the running collector immediately. A settings read failure never
+    suppresses a push.
+    """
+    from .paper_trader import get_db
+
+    try:
+        with get_db(db_path) as conn:
+            row = conn.execute(
+                "SELECT value FROM settings WHERE key = ?",
+                (MUTE_SETTING_PREFIX + category,),
+            ).fetchone()
+    except Exception as exc:
+        log.warning("ntfy mute lookup failed: %s", type(exc).__name__)
+        return False
+    return bool(row) and row["value"] == "1"
+
+
+def set_muted(category: str, muted: bool, db_path: Path | None = None) -> None:
+    """Persist the mute flag for one push category."""
+    from .paper_trader import get_db
+
+    if category not in MUTE_CATEGORIES:
+        raise ValueError(f"Unknown ntfy category: {category}")
+    with get_db(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO settings (key, value, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (MUTE_SETTING_PREFIX + category, "1" if muted else "0"),
+        )
 
 
 def _failure_detail(exc: Exception) -> str:
@@ -99,16 +145,21 @@ async def send_message(
     title: str | None = None,
     tags: str | None = None,
     priority: str | None = None,
+    category: str | None = None,
+    db_path: Path | None = None,
 ) -> bool:
     """
     Send an ntfy message with an httpx-like async client.
 
     Returns True when ntfy accepts the message. Returns False for missing
-    configuration or API/network failures.
+    configuration, a muted ``category``, or API/network failures.
     """
     topic_url = topic_url or config.NTFY_TOPIC_URL
     if not topic_url:
         log.debug("ntfy not configured; skipping notification")
+        return False
+    if category and is_muted(category, db_path):
+        log.debug("ntfy category %s muted; skipping notification", category)
         return False
 
     return await _post_ntfy(
@@ -135,5 +186,53 @@ async def notify_trade_opened(
         pending_count=pending_count,
     )
     return await send_message(
-        client, message, title="New Wethr Position", tags="moneybag"
+        client, message, title="New Wethr Position", tags="moneybag",
+        category="positions",
+    )
+
+
+def trade_won(trade: dict[str, Any]) -> bool:
+    """A YES trade wins when its bracket hit; a NO trade wins when it missed."""
+    return bool(trade["outcome"]) == (trade["side"] == "YES")
+
+
+def build_trade_settled_message(
+    trade: dict[str, Any],
+    lifetime_pnl: float | None = None,
+    wins: int | None = None,
+    losses: int | None = None,
+) -> str:
+    """Build the ntfy text for one settled position."""
+    city = trade["city"]
+    city_name = config.CITIES.get(city).name if city in config.CITIES else city
+    result = "WIN" if trade_won(trade) else "LOSS"
+
+    lines = [
+        f"{result} #{trade['id']} {city_name} {trade['target_date']}",
+        f"{trade['bracket_label']} {trade['side']} @ {trade['entry_price']:.2f}",
+        f"Stake: ${trade['size_usd']:.2f} · Edge at entry: {trade['edge']:+.1%}",
+        f"P/L: ${trade['pnl']:+.2f}",
+    ]
+    if lifetime_pnl is not None:
+        record = f" ({wins}W / {losses}L)" if wins is not None and losses is not None else ""
+        lines.append(f"Lifetime: ${lifetime_pnl:+,.2f}{record}")
+    return "\n".join(lines)
+
+
+async def notify_trade_settled(
+    client: Any,
+    trade: dict[str, Any],
+    lifetime_pnl: float | None = None,
+    wins: int | None = None,
+    losses: int | None = None,
+) -> bool:
+    """Notify ntfy that a position settled."""
+    won = trade_won(trade)
+    message = build_trade_settled_message(trade, lifetime_pnl, wins, losses)
+    return await send_message(
+        client,
+        message,
+        title=f"Wethr {'WIN' if won else 'LOSS'} #{trade['id']}",
+        tags="white_check_mark" if won else "x",
+        category="settlements",
     )

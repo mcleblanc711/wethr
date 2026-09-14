@@ -37,7 +37,7 @@ from .paper_trader import (
     print_report,
 )
 from .settlement import settle_date, settle_yesterday
-from .ntfy import notify_trade_opened
+from .ntfy import notify_trade_opened, notify_trade_settled
 from .trading import TradingClient
 from .calibration_cli import add_calibration_commands, dispatch_calibration_command
 from .calibration_ops import (
@@ -312,6 +312,22 @@ def _estimate_bma_probabilities(market, fc, bma_weights, emos_params):
     return result
 
 
+async def notify_settlements(client: httpx.AsyncClient, result: dict) -> None:
+    """Push one ntfy message per trade settled in a settle_date result."""
+    settled = result.get("settled") or []
+    if not settled:
+        return
+    stats = get_stats()
+    for trade in settled:
+        await notify_trade_settled(
+            client,
+            trade,
+            lifetime_pnl=stats.gross_pnl,
+            wins=stats.wins,
+            losses=stats.losses,
+        )
+
+
 async def run_loop(
     city_slugs: list[str] | None = None,
     interval: int = config.SCAN_INTERVAL_SECONDS,
@@ -355,6 +371,7 @@ async def run_loop(
                                 f"{result['signals_settled']} signals, "
                                 f"P&L: ${result['total_pnl']:+.2f}"
                             )
+                        await notify_settlements(client, result)
                     except Exception as e:
                         log.error(f"Settlement error for {settle_target}: {e}", exc_info=True)
                 last_settle_date = today
@@ -447,7 +464,7 @@ def main():
     sub.add_parser("doctor", help="Show local database/export wiring status")
 
     # telegram-bot
-    sub.add_parser("telegram-bot", help="Run the read-only Telegram command bot")
+    sub.add_parser("telegram-bot", help="Run the Telegram command bot")
 
     add_calibration_commands(sub)
 
@@ -530,6 +547,7 @@ def main():
                 tc = TradingClient()
                 tc.initialize()
                 result = await settle_date(client, target, trading_client=tc)
+                await notify_settlements(client, result)
                 print(
                     f"\nSettled {result['trades_settled']} trades, "
                     f"{result['signals_settled']} signals for {result['date']}"

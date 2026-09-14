@@ -1,5 +1,5 @@
 [Unit]
-Description=Wethr read-only Telegram command bot
+Description=Wethr Telegram command bot
 After=network-online.target
 Wants=network-online.target
 
