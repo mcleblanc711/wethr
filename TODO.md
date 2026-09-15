@@ -1,10 +1,15 @@
 # Wethr TODO: recalibration epoch
 
-Status: **planned, not started** (written 2026-09-14). The paper-trading
+Status: **in progress** (written 2026-09-14). §1 code landed on
+`agent/train-candidates`; §2–3 follow in separate PRs. The paper-trading
 collector keeps running as-is until this is picked up. Live trading is **not**
 a goal. Everything here is paper-only, so don't design around live promotion.
 
 ## Where things stand (verified 2026-09-14)
+
+Re-verified 2026-09-14 before starting: all facts below still held, except
+average win probability (~55%, not ~60%), `missing_resolution_metadata` (251),
+and the calibration ntfy drop-ins (already present).
 
 - **Serving model:** `legacy-emos-2026-04-08` (active since 2026-07-21).
   `raw-ensemble-v1` is the only other registered model (shadow). No candidates
@@ -20,7 +25,7 @@ a goal. Everything here is paper-only, so don't design around live promotion.
 - **Ledger (all `legacy-emos-2026-04-08` / `strategy_version='legacy-v0'`):**
   760 trades, 740 settled. **−$10,889 on $56.5k staked (−19% ROI)**, 153W / 587L.
   - The model is overconfident: its average win probability on taken trades is
-    ~60%, but it wins ~20%.
+    ~55%, but it wins ~21%.
   - YES long shots are the worst segment: avg entry $0.12, 9% hit rate, −$7.4k.
   - `bankroll_adjustment` = 2695.72, set by `scripts/reset_bankroll.py` on
     2026-04-08.
@@ -33,19 +38,21 @@ a goal. Everything here is paper-only, so don't design around live promotion.
 Goal: fresh per-lead-bucket models exist and accumulate out-of-sample shadow
 history, without waiting for a clean monthly archive.
 
-- `python3 run.py train-candidate --lead-bucket <b>` for each of `LEAD_BUCKETS`
+- [ ] **Ops (needs approval, writes `model_versions`):**
+  `python3 run.py train-candidate --lead-bucket <b>` for each of `LEAD_BUCKETS`
   (`src/calibration_ops.py:54`: `in_day, 0_24h, 24_48h, 48_72h, 72h_plus`).
   `train_candidate()` (`calibration_ops.py:1083`) does not need an archive. It
   uses a trailing 365-day window and honours the exclusions file.
-- Then run `python3 run.py evaluate <id>` on each candidate against
+- [ ] Then run `python3 run.py evaluate <id>` on each candidate against
   `legacy-emos-2026-04-08` and `raw-ensemble-v1`. Record Brier, CRPS, and
   reliability by probability band. The overconfidence found above is the thing
   to check.
-- **Fix `monthly_calibration.py`:** a failed archive must not also skip
-  training. Run training even when archiving raises, and report both results.
-  Its failure alert already goes through `src.ntfy` (PR #8).
-- **Ops:** add `WETHR_NTFY_TOPIC_URL` to `wethr-calibration-{daily,monthly}.service`
-  drop-ins. Right now their alerts are skipped without any notice.
+- [x] **Fix `monthly_calibration.py`:** archive, per-bucket training, and an
+  immediate evaluate (starting the shadow clock) each run independently; one
+  alert lists every failure and the unit exits non-zero. The daily job's
+  failure alert is now in the mutable `calibration` category too.
+- [x] **Ops:** `WETHR_NTFY_TOPIC_URL` is already set in the
+  `wethr-calibration-{daily,monthly}.service` drop-ins (checked 2026-09-14).
 - **Paper promotion:** `promote_model()` (`calibration_ops.py:1433`) applies
   strict gates: 28 shadow days, 60 city-days, 95% completeness, and beating
   both raw and control. Those gates were written with live trading in mind.
@@ -56,6 +63,9 @@ history, without waiting for a clean monthly archive.
   - (c) run the new epoch on a candidate without promoting it.
 
   Keep the audit trail whichever you choose.
+- [x] **Chosen: (b).** `promote MODEL --paper-override REASON` promotes despite
+  failed gates, stores `paper_override: {applied, reason, failed_gates}` in
+  `gate_report_json`, and is refused when `WETHR_LIVE=1`.
 - **Known data-quality caveats that affect gate numbers:** see
   `CALIBRATION_REVIEW_FOLLOWUPS.md` (cohort-mixing in `dataset_quality()`, and
   observation coverage with no dedupe or gap rule).

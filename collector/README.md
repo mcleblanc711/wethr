@@ -267,6 +267,7 @@ python run.py reconcile --date 2026-07-19
 python run.py train-candidate --lead-bucket 24_48h
 python run.py evaluate MODEL_VERSION
 python run.py promote MODEL_VERSION
+python run.py promote MODEL_VERSION --paper-override "reason"
 python run.py rollback
 python run.py archive --month 2026-06
 python run.py migrate-legacy --dry-run
@@ -274,7 +275,10 @@ python run.py migrate-legacy --dry-run
 
 `promote` changes only the active **paper** model and refuses activation until
 all chronological, Gamma-outcome, continuous-truth, completeness, shadow-time,
-and segment gates pass. It never enables live trading. Forecast snapshots store
+and segment gates pass. It never enables live trading. For paper-only epochs,
+`--paper-override REASON` promotes despite failed gates; the failed gates and
+the reason are recorded in `model_transitions.gate_report_json`, and the
+override is refused when `WETHR_LIVE=1`. Forecast snapshots store
 complete member values and verified prospective capture cutoffs; deterministic
 Previous Runs summaries are retained for audit but marked untrainable. Gamma is
 authoritative for bracket scoring, while NWS/METAR station readings are used for

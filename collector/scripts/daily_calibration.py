@@ -89,6 +89,12 @@ if __name__ == "__main__":
     except Exception as exc:
         async def alert() -> None:
             async with httpx.AsyncClient(headers={"User-Agent": config.USER_AGENT}) as client:
-                await send_message(client, f"Wethr daily calibration job failed: {exc}")
+                await send_message(
+                    client,
+                    f"Wethr daily calibration job failed: {exc}",
+                    title="Wethr Daily Job Failed",
+                    tags="rotating_light",
+                    category="calibration",
+                )
         asyncio.run(alert())
         raise

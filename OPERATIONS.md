@@ -157,6 +157,8 @@ those intervals, archive and candidate manifests retain the exclusions, and the
 promotion acceptance gate requires a new uninterrupted seven-day window.
 
 The monthly job writes immutable Parquet partitions plus row-count/SHA-256
-manifests under `data/archive/YYYY-MM/`, then creates shadow candidates. A
-candidate must still be explicitly evaluated and promoted; live trading remains
-disabled.
+manifests under `data/archive/YYYY-MM/`, then creates and evaluates one shadow
+candidate per lead bucket. A month that cannot be finalized does not skip
+training, and one failed bucket does not skip the others; all failures go out
+in one calibration alert and the unit exits non-zero. A
+candidate must still be explicitly promoted; live trading remains disabled.

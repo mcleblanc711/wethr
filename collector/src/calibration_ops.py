@@ -5,6 +5,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import shutil
 import sqlite3
 from collections import Counter, defaultdict
@@ -1430,7 +1431,22 @@ def promotion_gates(candidate_metrics: dict[str, Any], control_metrics: dict[str
     }
 
 
-def promote_model(model_version: str, db_path: Path | None = None) -> dict[str, bool]:
+def promote_model(
+    model_version: str,
+    db_path: Path | None = None,
+    *,
+    paper_override_reason: str | None = None,
+) -> dict[str, bool]:
+    """Promote a paper model after its gates pass.
+
+    ``paper_override_reason`` promotes despite failed gates for paper-only
+    epochs; the failed gates and reason are kept in the transition report.
+    """
+    override_reason = (paper_override_reason or "").strip() or None
+    if paper_override_reason is not None and override_reason is None:
+        raise ValueError("paper override requires a non-empty reason")
+    if override_reason and os.getenv("WETHR_LIVE", "0") == "1":
+        raise ValueError("paper override is refused while WETHR_LIVE=1")
     with get_db(db_path) as conn:
         conn.execute("BEGIN IMMEDIATE")
         candidate = conn.execute(
@@ -1461,11 +1477,15 @@ def promote_model(model_version: str, db_path: Path | None = None) -> dict[str, 
             "control_metrics": control_metrics,
             "gates": gates,
         }
-        if not all(gates.values()):
-            raise ValueError(
-                "promotion gates failed: "
-                + ", ".join(key for key, passed in gates.items() if not passed)
-            )
+        failed = [key for key, passed in gates.items() if not passed]
+        if failed and not override_reason:
+            raise ValueError("promotion gates failed: " + ", ".join(failed))
+        if override_reason:
+            report["paper_override"] = {
+                "applied": bool(failed),
+                "reason": override_reason,
+                "failed_gates": failed,
+            }
         now = iso_utc()
         if control["id"] != LEGACY_MODEL_VERSION:
             conn.execute(
