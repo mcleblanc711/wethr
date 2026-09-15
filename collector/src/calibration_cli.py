@@ -52,6 +52,10 @@ def add_calibration_commands(sub: argparse._SubParsersAction) -> None:
 
     parser = sub.add_parser("promote", help="Atomically promote a paper model after all gates pass")
     parser.add_argument("model_version")
+    parser.add_argument(
+        "--paper-override", metavar="REASON", default=None,
+        help="Paper only: promote despite failed gates, recording them and REASON",
+    )
 
     parser = sub.add_parser("rollback", help="Restore a previous active paper model")
     parser.add_argument("model_version", nargs="?", default=None)
@@ -83,17 +87,26 @@ def dispatch_calibration_command(args: argparse.Namespace) -> bool:
     elif args.command == "evaluate":
         print(json.dumps(evaluate_model(args.model_version), indent=2, sort_keys=True))
     elif args.command == "promote":
-        gates = promote_model(args.model_version)
+        gates = promote_model(args.model_version, paper_override_reason=args.paper_override)
+        failed = [key for key, passed in gates.items() if not passed]
+        override_note = (
+            f"\nPaper override ({args.paper_override}); failed gates: {', '.join(failed)}"
+            if failed else ""
+        )
         async def notify() -> None:
             async with httpx.AsyncClient(headers={"User-Agent": config.USER_AGENT}) as client:
                 await send_message(
                     client,
-                    f"Wethr paper model promoted: {args.model_version}\nLive trading remains disabled.",
+                    f"Wethr paper model promoted: {args.model_version}{override_note}"
+                    "\nLive trading remains disabled.",
                     title="Wethr Model Promoted",
                     category="calibration",
                 )
         asyncio.run(notify())
-        print(json.dumps({"promoted": args.model_version, "gates": gates, "live_trading": False}, indent=2))
+        print(json.dumps({
+            "promoted": args.model_version, "gates": gates, "failed_gates": failed,
+            "paper_override": args.paper_override if failed else None, "live_trading": False,
+        }, indent=2))
     elif args.command == "rollback":
         restored = rollback_model(args.model_version)
         print(json.dumps({"active_model": restored, "live_trading": False}, indent=2))
