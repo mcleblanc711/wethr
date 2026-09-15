@@ -1,7 +1,8 @@
 # Wethr TODO: recalibration epoch
 
 Status: **in progress** (written 2026-09-14). §1 code landed on
-`agent/train-candidates`, §2 on `agent/strategy-epochs`; §3 follows. The paper-trading
+`agent/train-candidates`, §2 on `agent/strategy-epochs`,
+§3 ordering on `agent/best-first` (stacked PRs). §4 waits. The paper-trading
 collector keeps running as-is until this is picked up. Live trading is **not**
 a goal. Everything here is paper-only, so don't design around live promotion.
 
@@ -113,6 +114,9 @@ visible as "pre-calibration", and the new epoch gets its own P/L and bankroll.
 
 ## 3. Best-first slot filling
 
+**Ordering done on `agent/best-first`.** The per-city/date cap and YES
+long-shot filter below are still open, to design in a follow-up session.
+
 Goal: when slots are limited, open positions on the strongest signals, not
 whichever market happened to be scanned first.
 
@@ -121,26 +125,31 @@ whichever market happened to be scanned first.
   each edge with `size_position(bp, bankroll, daily_pnl, pending)` and records
   it immediately. Once `pending >= MAX_PENDING_TRADES`, sizing rejects
   everything else, so slots go first-come in market-discovery order.
-- **Change:** do it in two passes.
+- [x] **Change:** do it in two passes (`TradeCandidate`, `trade_rank_key`,
+  `place_ranked_trades` in `src/main.py`).
   1. Evaluate every market and bracket (record signals as today), then collect
      candidates that pass the edge threshold and `ps.is_valid`, ignoring the
      pending count.
   2. Rank them, then record trades best-first until the cap or the daily loss
      limit is reached.
-- **Ranking key to decide:** candidates are `|edge|`, expected value per
+- [x] **Ranking key: full Kelly fraction** (chosen 2026-09-14), ties by
+  |edge| then city/date/label. EV per dollar is q/p − 1 and favours long shots
+  even more than raw edge.
+- Original notes on the ranking key: candidates are `|edge|`, expected value per
   dollar (`model_prob*win_pnl + (1-model_prob)*loss_pnl) / size`), or
   Kelly fraction. Prefer EV per dollar or Kelly; raw edge favours cheap long
   shots, which is where the losses are.
-- **Also consider:**
+- [ ] **Also consider (deferred to a follow-up session):**
   - at most N positions per city/date (correlated brackets on the same market);
   - a minimum entry price or a YES long-shot filter as a strategy parameter
     for the new epoch;
-  - the ordering must stay deterministic for tests.
-- `pending_count` in the new-position ntfy push must still be accurate.
+  - [x] the ordering must stay deterministic for tests.
+- [x] `pending_count` in the new-position ntfy push must still be accurate.
 - The live-trade branch (`trading_client.is_live`) stays in the same loop, but
-  live is off. Keep the behaviour identical apart from ordering.
-- Tests: with the cap at 2 and 5 candidates, the top 2 by the ranking key
-  are recorded, regardless of market order.
+  live is off. Keep the behaviour identical apart from ordering. [x]
+- [x] Tests: `collector/tests/test_best_first.py` (cap 2 with 5 candidates in
+  several orders, ties, duplicates, existing pending, daily loss, live branch,
+  and a stubbed `scan_and_trade`).
 
 ## 4. Raise the open-position cap
 

@@ -17,6 +17,7 @@ import argparse
 import asyncio
 import logging
 import sys
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -26,7 +27,7 @@ from .markets import WeatherMarket, discover_markets
 from .ensemble import fetch_all_ensembles, EnsembleForecast, RateLimited
 from .probability import find_edges, estimate_bracket_probabilities, BracketProbability
 from .calibration import estimate_calibrated_probabilities
-from .sizing import size_position
+from .sizing import PositionSize, size_position
 from .paper_trader import (
     init_db,
     record_paper_trade,
@@ -124,6 +125,89 @@ async def scan(
     return markets, edges
 
 
+@dataclass(frozen=True)
+class TradeCandidate:
+    """A bracket that cleared every sizing gate except open-slot availability."""
+
+    city: str
+    target_date: date
+    market_volume: float
+    model_version_id: str
+    ps: PositionSize
+
+
+def trade_rank_key(candidate: TradeCandidate) -> tuple:
+    """Best first: full Kelly, then |edge|, then a stable market identity.
+
+    Kelly (q - p) / (1 - p) discounts cheap long shots that raw edge or EV per
+    dollar would favour.
+    """
+    bp = candidate.ps.bracket_prob
+    return (
+        -candidate.ps.full_kelly,
+        -abs(bp.edge),
+        candidate.city,
+        candidate.target_date,
+        bp.bracket.label,
+    )
+
+
+async def place_ranked_trades(
+    client: httpx.AsyncClient,
+    candidates: list[TradeCandidate],
+    bankroll: float,
+    daily_pnl: float,
+    pending: int,
+    strategy_version: str,
+    trading_client: "TradingClient | None" = None,
+) -> list[int]:
+    """Record paper trades best-first until the open-position cap binds.
+
+    Each candidate is re-sized with the live pending count so the cap and
+    daily-loss gates stay in ``size_position``. A duplicate of an open
+    position is skipped without consuming a slot.
+    """
+    trade_ids: list[int] = []
+    for candidate in sorted(candidates, key=trade_rank_key):
+        if pending >= config.MAX_PENDING_TRADES:
+            break
+        ps = size_position(candidate.ps.bracket_prob, bankroll, daily_pnl, pending)
+        if not ps.is_valid:
+            continue
+        # Paper trade (always — for tracking)
+        tid = record_paper_trade(
+            candidate.city, candidate.target_date, ps, candidate.market_volume,
+            model_version_id=candidate.model_version_id,
+            strategy_version=strategy_version,
+        )
+        if tid is None:
+            continue
+        trade_ids.append(tid)
+        pending += 1
+        await notify_trade_opened(
+            client,
+            trade_id=tid,
+            city=candidate.city,
+            target_date=candidate.target_date,
+            ps=ps,
+            market_volume=candidate.market_volume,
+            pending_count=pending,
+        )
+
+        # Live trade (if client provided and live mode on)
+        if trading_client and trading_client.is_live:
+            from .trading import execute_trade
+            result = execute_trade(
+                trading_client,
+                candidate.city,
+                candidate.target_date.isoformat(),
+                ps,
+            )
+            if not result.success:
+                log.warning(f"Live trade failed: {result.error}")
+    return trade_ids
+
+
 async def scan_and_trade(
     client: httpx.AsyncClient,
     city_slugs: list[str] | None = None,
@@ -178,7 +262,8 @@ async def scan_and_trade(
     daily_pnl = get_daily_pnl(strategy_version=epoch.label)
     pending = len(get_pending_trades())
 
-    trade_ids = []
+    # Pass 1: evaluate every market and bracket, ignoring open slots.
+    candidates: list[TradeCandidate] = []
 
     for market in markets:
         city_fc = forecasts.get(market.city, {})
@@ -213,39 +298,21 @@ async def scan_and_trade(
             if abs(bp.edge) < config.MIN_EDGE_THRESHOLD:
                 continue
 
-            # Size position
-            ps = size_position(bp, bankroll, daily_pnl, pending)
+            ps = size_position(bp, bankroll, daily_pnl, pending_count=0)
             if ps.is_valid:
-                # Paper trade (always — for tracking)
-                tid = record_paper_trade(
-                    market.city, market.target_date, ps, market.total_volume,
+                candidates.append(TradeCandidate(
+                    city=market.city,
+                    target_date=market.target_date,
+                    market_volume=market.total_volume,
                     model_version_id=selected_model_id,
-                    strategy_version=epoch.label,
-                )
-                if tid is not None:
-                    trade_ids.append(tid)
-                    pending += 1
-                    await notify_trade_opened(
-                        client,
-                        trade_id=tid,
-                        city=market.city,
-                        target_date=market.target_date,
-                        ps=ps,
-                        market_volume=market.total_volume,
-                        pending_count=pending,
-                    )
+                    ps=ps,
+                ))
 
-                    # Live trade (if client provided and live mode on)
-                    if trading_client and trading_client.is_live:
-                        from .trading import execute_trade
-                        result = execute_trade(
-                            trading_client,
-                            market.city,
-                            market.target_date.isoformat(),
-                            ps,
-                        )
-                        if not result.success:
-                            log.warning(f"Live trade failed: {result.error}")
+    # Pass 2: fill the remaining slots with the strongest candidates.
+    trade_ids = await place_ranked_trades(
+        client, candidates, bankroll, daily_pnl, pending,
+        strategy_version=epoch.label, trading_client=trading_client,
+    )
 
     if trade_ids:
         log.info(f"📝 Placed {len(trade_ids)} paper trades")
