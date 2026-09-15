@@ -34,6 +34,10 @@ from .paper_trader import (
     get_stats,
     get_pending_trades,
     get_daily_pnl,
+    get_current_epoch,
+    list_epochs,
+    start_epoch,
+    LEGACY_STRATEGY_VERSION,
     print_report,
 )
 from .settlement import settle_date, settle_yesterday
@@ -166,9 +170,12 @@ async def scan_and_trade(
     emos_params = _load_emos_params_safe()
     bma_weights = _load_bma_weights_safe()
 
-    stats = get_stats()
+    # Size against the current strategy epoch's bankroll and realized daily
+    # P/L; open positions from any epoch still occupy slots.
+    epoch = get_current_epoch()
+    stats = get_stats(strategy_version=epoch.label)
     bankroll = stats.bankroll
-    daily_pnl = get_daily_pnl()
+    daily_pnl = get_daily_pnl(strategy_version=epoch.label)
     pending = len(get_pending_trades())
 
     trade_ids = []
@@ -213,6 +220,7 @@ async def scan_and_trade(
                 tid = record_paper_trade(
                     market.city, market.target_date, ps, market.total_volume,
                     model_version_id=selected_model_id,
+                    strategy_version=epoch.label,
                 )
                 if tid is not None:
                     trade_ids.append(tid)
@@ -317,14 +325,19 @@ async def notify_settlements(client: httpx.AsyncClient, result: dict) -> None:
     settled = result.get("settled") or []
     if not settled:
         return
-    stats = get_stats()
+    epoch_stats = {}
     for trade in settled:
+        label = trade.get("strategy_version") or LEGACY_STRATEGY_VERSION
+        if label not in epoch_stats:
+            epoch_stats[label] = get_stats(strategy_version=label)
+        stats = epoch_stats[label]
         await notify_trade_settled(
             client,
             trade,
-            lifetime_pnl=stats.gross_pnl,
+            epoch_pnl=stats.gross_pnl,
             wins=stats.wins,
             losses=stats.losses,
+            epoch_label=label,
         )
 
 
@@ -466,6 +479,20 @@ def main():
     # telegram-bot
     sub.add_parser("telegram-bot", help="Run the Telegram command bot")
 
+    # epoch
+    p_epoch = sub.add_parser("epoch", help="List or start paper strategy epochs")
+    epoch_sub = p_epoch.add_subparsers(dest="epoch_command", required=True)
+    epoch_sub.add_parser("list", help="List strategy epochs with P/L and bankroll")
+    p_epoch_start = epoch_sub.add_parser(
+        "start", help="Start a new epoch; new trades are tagged with its label",
+    )
+    p_epoch_start.add_argument("--label", required=True, help="Epoch label, e.g. calib-v1")
+    p_epoch_start.add_argument(
+        "--bankroll", type=float, default=None,
+        help="Starting paper bankroll (defaults to WETHR_BANKROLL)",
+    )
+    p_epoch_start.add_argument("--notes", default=None, help="Free-text notes")
+
     add_calibration_commands(sub)
 
     args = parser.parse_args()
@@ -603,6 +630,31 @@ def main():
         from .ops import doctor_report
 
         print(doctor_report())
+
+    elif args.command == "epoch":
+        if args.epoch_command == "start":
+            try:
+                epoch = start_epoch(args.label, args.bankroll, args.notes)
+            except ValueError as exc:
+                print(f"Epoch not started: {exc}", file=sys.stderr)
+                raise SystemExit(2) from exc
+            print(
+                f"Started epoch {epoch.label} at {epoch.started_at} UTC "
+                f"with bankroll ${epoch.starting_bankroll:,.2f}. "
+                "Restart the collector if it is running older code."
+            )
+        else:
+            current = get_current_epoch()
+            for epoch in list_epochs():
+                stats = get_stats(strategy_version=epoch.label)
+                marker = "*" if epoch.label == current.label else " "
+                print(
+                    f"{marker} {epoch.label:<20} started {epoch.started_at}  "
+                    f"start ${epoch.starting_bankroll:>10,.2f}  "
+                    f"P/L ${stats.gross_pnl:>+10,.2f}  "
+                    f"{stats.wins}W/{stats.losses}L  {stats.pending_trades} open  "
+                    f"bankroll ${stats.bankroll:>10,.2f}"
+                )
 
     elif args.command == "telegram-bot":
         from .telegram_bot import run_bot

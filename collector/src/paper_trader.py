@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import sqlite3
 from os import PathLike
 from contextlib import contextmanager
@@ -185,6 +186,7 @@ def init_db(db_path: Path | None = None) -> None:
         # intact and are explicitly tagged as legacy provenance.
         from .ledger import init_calibration_ledger
         init_calibration_ledger(conn)
+        _init_strategy_epochs(conn)
     log.info(f"Database initialized: {db_path or config.DB_PATH}")
 
 
@@ -199,6 +201,146 @@ def _coerce_legacy_db_path_arg(
 
 
 # ---------------------------------------------------------------------------
+# Strategy epochs
+# ---------------------------------------------------------------------------
+
+LEGACY_STRATEGY_VERSION = "legacy-v0"
+CURRENT_EPOCH_SETTING_KEY = "current_strategy_epoch"
+_EPOCH_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+@dataclass
+class StrategyEpoch:
+    label: str
+    started_at: str
+    starting_bankroll: float
+    notes: str | None = None
+    params: dict | None = None
+
+
+def _init_strategy_epochs(conn: sqlite3.Connection) -> None:
+    """Create the epoch registry and seed the legacy epoch once.
+
+    ``legacy-v0`` starts at ``INITIAL_BANKROLL + bankroll_adjustment`` so its
+    bankroll matches what ``get_stats`` reported before epochs existed.
+    """
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS strategy_epochs (
+            label TEXT PRIMARY KEY,
+            started_at TEXT NOT NULL,
+            starting_bankroll REAL NOT NULL,
+            notes TEXT,
+            params_json TEXT NOT NULL DEFAULT '{}'
+        )
+    """)
+    adjustment = conn.execute(
+        "SELECT value FROM settings WHERE key = 'bankroll_adjustment'"
+    ).fetchone()
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO strategy_epochs (label, started_at, starting_bankroll, notes)
+        VALUES (
+            ?,
+            COALESCE(
+                (SELECT MIN(created_at) FROM trades WHERE strategy_version = ?),
+                datetime('now')
+            ),
+            ?,
+            'Pre-calibration ledger (seeded from bankroll_adjustment)'
+        )
+        """,
+        (
+            LEGACY_STRATEGY_VERSION,
+            LEGACY_STRATEGY_VERSION,
+            config.INITIAL_BANKROLL + (float(adjustment[0]) if adjustment else 0.0),
+        ),
+    )
+
+
+def _epoch_from_row(row: sqlite3.Row) -> StrategyEpoch:
+    return StrategyEpoch(
+        label=row["label"],
+        started_at=row["started_at"],
+        starting_bankroll=float(row["starting_bankroll"]),
+        notes=row["notes"],
+        params=json.loads(row["params_json"] or "{}"),
+    )
+
+
+def _current_epoch(conn: sqlite3.Connection) -> StrategyEpoch:
+    setting = conn.execute(
+        "SELECT value FROM settings WHERE key = ?", (CURRENT_EPOCH_SETTING_KEY,)
+    ).fetchone()
+    label = setting["value"] if setting else LEGACY_STRATEGY_VERSION
+    row = conn.execute("SELECT * FROM strategy_epochs WHERE label = ?", (label,)).fetchone()
+    if row is None and label != LEGACY_STRATEGY_VERSION:
+        log.warning(f"Unknown strategy epoch {label!r} in settings; using {LEGACY_STRATEGY_VERSION}")
+        row = conn.execute(
+            "SELECT * FROM strategy_epochs WHERE label = ?", (LEGACY_STRATEGY_VERSION,)
+        ).fetchone()
+    if row is None:
+        return StrategyEpoch(LEGACY_STRATEGY_VERSION, "", config.INITIAL_BANKROLL)
+    return _epoch_from_row(row)
+
+
+def get_current_epoch(db_path: Path | None = None) -> StrategyEpoch:
+    """Return the epoch new paper trades are recorded under."""
+    with get_db(db_path) as conn:
+        return _current_epoch(conn)
+
+
+def list_epochs(db_path: Path | None = None) -> list[StrategyEpoch]:
+    """Return every strategy epoch, legacy first, then oldest first."""
+    with get_db(db_path) as conn:
+        rows = conn.execute(
+            "SELECT * FROM strategy_epochs ORDER BY label != ?, started_at, label",
+            (LEGACY_STRATEGY_VERSION,),
+        ).fetchall()
+    return [_epoch_from_row(row) for row in rows]
+
+
+def start_epoch(
+    label: str,
+    starting_bankroll: float | None = None,
+    notes: str | None = None,
+    db_path: Path | None = None,
+) -> StrategyEpoch:
+    """Register a new strategy epoch and make it current.
+
+    Epochs are additive: existing trades keep their ``strategy_version``.
+    """
+    if not _EPOCH_LABEL_RE.match(label or ""):
+        raise ValueError(
+            "epoch label must be 1-64 characters of letters, digits, '.', '_' or '-'"
+        )
+    bankroll = config.INITIAL_BANKROLL if starting_bankroll is None else float(starting_bankroll)
+    if bankroll <= 0:
+        raise ValueError("starting bankroll must be positive")
+    started_at = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with get_db(db_path) as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if conn.execute("SELECT 1 FROM strategy_epochs WHERE label = ?", (label,)).fetchone():
+            raise ValueError(f"strategy epoch {label!r} already exists")
+        conn.execute(
+            "INSERT INTO strategy_epochs (label, started_at, starting_bankroll, notes) "
+            "VALUES (?, ?, ?, ?)",
+            (label, started_at, bankroll, notes),
+        )
+        conn.execute(
+            """
+            INSERT INTO settings (key, value, updated_at)
+            VALUES (?, ?, datetime('now'))
+            ON CONFLICT(key) DO UPDATE SET
+                value = excluded.value,
+                updated_at = excluded.updated_at
+            """,
+            (CURRENT_EPOCH_SETTING_KEY, label),
+        )
+    log.info(f"Started strategy epoch {label} with bankroll ${bankroll:,.2f}")
+    return StrategyEpoch(label, started_at, bankroll, notes, {})
+
+
+# ---------------------------------------------------------------------------
 # Trade recording
 # ---------------------------------------------------------------------------
 
@@ -210,10 +352,13 @@ def record_paper_trade(
     db_path: Path | None = None,
     model_version_id: str | None = None,
     prediction_snapshot_id: int | None = None,
+    strategy_version: str | None = None,
 ) -> int | None:
     """
     Record a paper trade with city/date context. Returns trade ID,
     or None if a trade already exists for this bracket.
+
+    ``strategy_version`` defaults to the current strategy epoch.
     """
     market_volume, db_path = _coerce_legacy_db_path_arg(market_volume, db_path)
     bp = ps.bracket_prob
@@ -250,7 +395,8 @@ def record_paper_trade(
                 (model_version_id, city, target_date.isoformat(), b.label),
             ).fetchone()
             prediction_snapshot_id = prediction["id"] if prediction else None
-
+        if strategy_version is None:
+            strategy_version = _current_epoch(conn).label
 
         cursor = conn.execute(
             """
@@ -261,7 +407,7 @@ def record_paper_trade(
                 member_count, total_members, confidence,
                 kelly_full, kelly_frac, token_id, condition_id,
                 market_volume, model_version_id, prediction_snapshot_id, strategy_version
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'legacy-v0')
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 city,
@@ -286,6 +432,7 @@ def record_paper_trade(
                 market_volume,
                 model_version_id,
                 prediction_snapshot_id,
+                strategy_version,
             ),
         )
         trade_id = cursor.lastrowid
@@ -524,46 +671,68 @@ class TradingStats:
     bankroll: float = config.INITIAL_BANKROLL
 
 
-def get_stats(db_path: Path | None = None) -> TradingStats:
-    """Get overall trading statistics."""
+def get_stats(
+    db_path: Path | None = None,
+    strategy_version: str | None = None,
+) -> TradingStats:
+    """Get trading statistics, optionally for one strategy epoch.
+
+    Filtered stats report that epoch's bankroll (its starting bankroll plus
+    its realized P/L). Unfiltered stats cover the whole ledger and report the
+    current epoch's bankroll, which is what sizing uses.
+    """
     stats = TradingStats()
+    where = "WHERE strategy_version = ?" if strategy_version is not None else "WHERE 1 = 1"
+    params: tuple = (strategy_version,) if strategy_version is not None else ()
 
     with get_db(db_path) as conn:
-        # Trade counts
-        row = conn.execute("SELECT COUNT(*) as n FROM trades").fetchone()
-        stats.total_trades = row["n"]
-
         row = conn.execute(
-            "SELECT COUNT(*) as n FROM trades WHERE settled = 1"
+            f"""
+            SELECT COUNT(*) AS n,
+                   COALESCE(SUM(settled = 1), 0) AS settled,
+                   COALESCE(SUM(settled = 1 AND pnl > 0), 0) AS wins,
+                   SUM(CASE WHEN settled = 1 THEN pnl END) AS total,
+                   SUM(CASE WHEN settled = 1 THEN size_usd END) AS settled_stake,
+                   AVG(CASE WHEN settled = 1 THEN pnl END) AS avg_pnl,
+                   AVG(CASE WHEN settled = 1 THEN edge END) AS avg_edge
+            FROM trades {where}
+            """,
+            params,
         ).fetchone()
-        stats.settled_trades = row["n"]
+        stats.total_trades = row["n"]
+        stats.settled_trades = row["settled"]
         stats.pending_trades = stats.total_trades - stats.settled_trades
-
         if stats.settled_trades > 0:
-            row = conn.execute(
-                "SELECT COUNT(*) as n FROM trades WHERE settled = 1 AND pnl > 0"
-            ).fetchone()
-            stats.wins = row["n"]
+            stats.wins = row["wins"]
             stats.losses = stats.settled_trades - stats.wins
             stats.win_rate = stats.wins / stats.settled_trades
-
-            row = conn.execute(
-                "SELECT SUM(pnl) as total, SUM(size_usd) as settled_stake, "
-                "AVG(pnl) as avg_pnl, AVG(edge) as avg_edge "
-                "FROM trades WHERE settled = 1"
-            ).fetchone()
             stats.gross_pnl = row["total"] or 0.0
             stats.settled_stake = row["settled_stake"] or 0.0
             stats.avg_pnl = row["avg_pnl"] or 0.0
             stats.avg_edge = row["avg_edge"] or 0.0
 
-        row = conn.execute(
-            "SELECT value FROM settings WHERE key = 'bankroll_adjustment'"
-        ).fetchone()
-        adjustment = float(row["value"]) if row else 0.0
-        stats.bankroll = config.INITIAL_BANKROLL + adjustment + stats.gross_pnl
+        epoch = _current_epoch(conn)
+        if strategy_version is None or strategy_version == epoch.label:
+            starting = epoch.starting_bankroll
+            epoch_label = epoch.label
+        else:
+            found = conn.execute(
+                "SELECT starting_bankroll FROM strategy_epochs WHERE label = ?",
+                (strategy_version,),
+            ).fetchone()
+            starting = float(found["starting_bankroll"]) if found else config.INITIAL_BANKROLL
+            epoch_label = strategy_version
+        if strategy_version is None:
+            epoch_pnl = conn.execute(
+                "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+                "WHERE settled = 1 AND strategy_version = ?",
+                (epoch_label,),
+            ).fetchone()[0]
+        else:
+            epoch_pnl = stats.gross_pnl
+        stats.bankroll = starting + epoch_pnl
 
-        # Brier score from signals
+        # Brier score from signals (signals are not tagged by epoch)
         row = conn.execute(
             "SELECT AVG(brier_score) as brier, COUNT(*) as n "
             "FROM signals WHERE brier_score IS NOT NULL"
@@ -580,37 +749,31 @@ def reset_bankroll(
     db_path: Path | None = None,
 ) -> float:
     """
-    Reset the displayed bankroll to `target` without touching any trade data.
+    Reset the current epoch's bankroll to `target` without touching trades.
 
-    Stores a `bankroll_adjustment` in the settings table so that:
-        bankroll = INITIAL_BANKROLL + adjustment + gross_pnl == target
+    Adjusts the epoch's `starting_bankroll` so that
+        starting_bankroll + epoch realized P&L == target
 
     All historical trades, signals, and P&L records are preserved.
-    Returns the adjustment value written.
+    Returns the change applied to the starting bankroll.
     """
     with get_db(db_path) as conn:
-        row = conn.execute(
-            "SELECT SUM(pnl) as total FROM trades WHERE settled = 1"
-        ).fetchone()
-        gross_pnl = row["total"] or 0.0
-
-        # adjustment = target - INITIAL_BANKROLL - gross_pnl
-        adjustment = target - config.INITIAL_BANKROLL - gross_pnl
-
+        epoch = _current_epoch(conn)
+        epoch_pnl = conn.execute(
+            "SELECT COALESCE(SUM(pnl), 0) FROM trades "
+            "WHERE settled = 1 AND strategy_version = ?",
+            (epoch.label,),
+        ).fetchone()[0]
+        new_start = target - epoch_pnl
+        adjustment = new_start - epoch.starting_bankroll
         conn.execute(
-            """
-            INSERT INTO settings (key, value, updated_at)
-            VALUES ('bankroll_adjustment', ?, datetime('now'))
-            ON CONFLICT(key) DO UPDATE SET
-                value = excluded.value,
-                updated_at = excluded.updated_at
-            """,
-            (str(adjustment),),
+            "UPDATE strategy_epochs SET starting_bankroll = ? WHERE label = ?",
+            (new_start, epoch.label),
         )
 
     log.info(
-        f"Bankroll reset to ${target:,.2f} "
-        f"(adjustment={adjustment:+,.2f}, gross_pnl={gross_pnl:,.2f})"
+        f"Bankroll for epoch {epoch.label} reset to ${target:,.2f} "
+        f"(adjustment={adjustment:+,.2f}, epoch_pnl={epoch_pnl:,.2f})"
     )
     return adjustment
 
@@ -624,14 +787,20 @@ def get_pending_trades(db_path: Path | None = None) -> list[dict]:
         return [dict(r) for r in rows]
 
 
-def get_daily_pnl(trade_date: date | None = None, db_path: Path | None = None) -> float:
-    """Get P&L for a specific date (defaults to today)."""
+def get_daily_pnl(
+    trade_date: date | None = None,
+    db_path: Path | None = None,
+    strategy_version: str | None = None,
+) -> float:
+    """Get P&L settled on a date (defaults to today), optionally for one epoch."""
     d = (trade_date or datetime.now(timezone.utc).date()).isoformat()
+    epoch_filter = " AND strategy_version = ?" if strategy_version is not None else ""
+    params = (d, strategy_version) if strategy_version is not None else (d,)
     with get_db(db_path) as conn:
         row = conn.execute(
             "SELECT COALESCE(SUM(pnl), 0) as pnl FROM trades "
-            "WHERE settled = 1 AND DATE(settled_at) = ?",
-            (d,),
+            "WHERE settled = 1 AND DATE(settled_at) = ?" + epoch_filter,
+            params,
         ).fetchone()
         return row["pnl"]
 
@@ -691,8 +860,20 @@ def print_report(db_path: Path | None = None) -> str:
         f"  Gross P&L:  ${stats.gross_pnl:+,.2f}",
         f"  Avg P&L:    ${stats.avg_pnl:+,.2f} per trade",
         f"  Avg edge:   {stats.avg_edge:+.1%}",
-        f"  Bankroll:   ${stats.bankroll:,.2f}",
+        f"  Bankroll:   ${stats.bankroll:,.2f} (current epoch)",
     ]
+
+    current = get_current_epoch(db_path)
+    lines.append("")
+    lines.append("  Strategy epochs:")
+    for epoch in list_epochs(db_path):
+        epoch_stats = get_stats(db_path, strategy_version=epoch.label)
+        marker = "*" if epoch.label == current.label else " "
+        lines.append(
+            f"   {marker}{epoch.label}: ${epoch_stats.gross_pnl:+,.2f} "
+            f"({epoch_stats.wins}W / {epoch_stats.losses}L, {epoch_stats.pending_trades} open), "
+            f"bankroll ${epoch_stats.bankroll:,.2f}"
+        )
 
     if stats.brier_score is not None:
         lines.append(f"  Brier score: {stats.brier_score:.4f} (n={stats.brier_n})")
