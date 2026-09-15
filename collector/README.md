@@ -114,6 +114,11 @@ size  = kelly × 0.05 × bankroll
 size  = min(size, 0.05 × bankroll, $100)
 ```
 
+Each scan evaluates every market first, then fills open-position slots
+(`WETHR_MAX_PENDING`) best-first by full Kelly fraction, breaking ties by
+|edge| and then city, date and bracket. Kelly discounts cheap long shots that
+raw edge would favour, and slots no longer depend on market discovery order.
+
 Why 5%? Full Kelly assumes perfect probability estimates. At 5%, a 2x overestimate of edge costs much less capital than full Kelly while still ranking larger edges above smaller ones.
 
 ## Strategy epochs
