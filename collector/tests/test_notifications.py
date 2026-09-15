@@ -58,8 +58,10 @@ def settled_trade(**overrides) -> dict:
     return trade
 
 
-def test_settled_message_reports_win_loss_and_lifetime():
-    win = ntfy.build_trade_settled_message(settled_trade(), 123.45, 7, 3)
+def test_settled_message_reports_win_loss_and_epoch_total():
+    win = ntfy.build_trade_settled_message(
+        settled_trade(strategy_version="calib-v1"), 123.45, 7, 3
+    )
     loss = ntfy.build_trade_settled_message(
         settled_trade(side="NO", outcome=True, pnl=-20.0)
     )
@@ -68,9 +70,9 @@ def test_settled_message_reports_win_loss_and_lifetime():
     assert "72°F - 74°F YES @ 0.25" in win
     assert "Edge at entry: +15.0%" in win
     assert "P/L: $+60.00" in win
-    assert "Lifetime: $+123.45 (7W / 3L)" in win
+    assert "Epoch calib-v1: $+123.45 (7W / 3L)" in win
     assert loss.startswith("LOSS #729")
-    assert "Lifetime" not in loss
+    assert "Epoch" not in loss
 
 
 def test_muted_category_skips_the_post(tmp_path: Path):

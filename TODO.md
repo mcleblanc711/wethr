@@ -1,7 +1,7 @@
 # Wethr TODO: recalibration epoch
 
 Status: **in progress** (written 2026-09-14). §1 code landed on
-`agent/train-candidates`; §2–3 follow in separate PRs. The paper-trading
+`agent/train-candidates`, §2 on `agent/strategy-epochs`; §3 follows. The paper-trading
 collector keeps running as-is until this is picked up. Live trading is **not**
 a goal. Everything here is paper-only, so don't design around live promotion.
 
@@ -72,6 +72,11 @@ history, without waiting for a clean monthly archive.
 
 ## 2. Epoch-split P/L ("pre-calibration" vs current)
 
+**Done (code) on `agent/strategy-epochs`.** Remaining ops step: after merge
+and a collector/Telegram restart, run
+`python3 run.py epoch start --label <name> --bankroll 10000` (fresh $10k chosen
+2026-09-14), ideally right after a `--paper-override` promotion.
+
 Goal: start a new strategy epoch without deleting anything. Lifetime P/L stays
 visible as "pre-calibration", and the new epoch gets its own P/L and bankroll.
 
@@ -79,17 +84,22 @@ visible as "pre-calibration", and the new epoch gets its own P/L and bankroll.
   `strategy_version TEXT NOT NULL DEFAULT 'legacy-v0'`.
   - `record_paper_trade()` (`src/paper_trader.py:205`) **hardcodes**
     `'legacy-v0'` in the INSERT and falls back to `legacy-emos-2026-04-08`.
-- Add `WETHR_STRATEGY_VERSION` (or a `settings` row, `current_strategy_epoch`)
-  and write it on every new trade.
+- [x] Settings row `current_strategy_epoch` plus a `strategy_epochs` registry
+  (label, started_at, starting_bankroll, notes, params_json); written on every
+  new trade.
   - A settings row can be switched without a restart. Recommended; the Telegram
     bot already writes settings for mutes.
   - Keep a record of when each epoch started, its label, and the starting
     bankroll.
-- `get_stats()` (`paper_trader.py:527`) takes an optional `strategy_version`
-  filter. Bankroll per epoch = epoch starting bankroll + epoch P/L. Replace or
+- [x] `get_stats()` and `get_daily_pnl()` take an optional `strategy_version`
+  filter; `legacy-v0` is seeded at `INITIAL_BANKROLL + bankroll_adjustment`;
+  `reset_bankroll` now moves only the current epoch's starting bankroll. Bankroll per epoch = epoch starting bankroll + epoch P/L. Replace or
   generalize the global `bankroll_adjustment` approach. Sizing must use the
   **current epoch's** bankroll.
-- **Surfaces:**
+- [x] **Surfaces:** (`/pnl`, `/pnl all`, settlement push epoch line,
+  `print_report`, `epoch list`, and `strategy_version` in `export-settled`;
+  the n8n audit passes unknown fields through, and `signal-ledger/` does not
+  export trades)
   - Telegram `/pnl` shows the current epoch first, then "Pre-calibration
     (legacy-v0): −$10,889 …", then all-time.
   - Optional `/pnl all` for a per-epoch table.
@@ -99,8 +109,7 @@ visible as "pre-calibration", and the new epoch gets its own P/L and bankroll.
   - `print_report`, `export-settled` (n8n) and the Signal Ledger export may
     want a `strategy_version` field. Check `signal-ledger/` before changing
     export shapes.
-- Tests: epoch switch mid-ledger, per-epoch stats, and sizing using epoch
-  bankroll.
+- [x] Tests: `collector/tests/test_strategy_epochs.py`.
 
 ## 3. Best-first slot filling
 

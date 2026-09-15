@@ -225,6 +225,7 @@ def _record_settled_trade(
         "edge": trade["edge"],
         "outcome": outcome,
         "pnl": pnl,
+        "strategy_version": trade["strategy_version"],
     })
 
 

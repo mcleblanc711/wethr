@@ -20,7 +20,15 @@ import httpx
 from . import config
 from .ntfy import MUTE_CATEGORIES, is_muted, set_muted
 from .ops import default_audit_db_path
-from .paper_trader import get_db, get_pending_trades, get_stats
+from .paper_trader import (
+    LEGACY_STRATEGY_VERSION,
+    TradingStats,
+    get_current_epoch,
+    get_db,
+    get_pending_trades,
+    get_stats,
+    list_epochs,
+)
 from .telegram import _failure_detail, send_message
 
 log = logging.getLogger(__name__)
@@ -33,7 +41,8 @@ MAX_SETTLED = 20
 HELP_TEXT = (
     "Wethr paper-trading bot\n\n"
     "/positions — open paper positions\n"
-    "/pnl — lifetime realized paper P/L\n"
+    "/pnl — current epoch, pre-calibration, and all-time realized P/L\n"
+    "/pnl all — realized P/L per strategy epoch\n"
     "/settled [n] — last n settled trades (default 10, max 20)\n"
     "/trade <id> — one trade in detail, with audit divergence\n"
     "/today — positions opened and settled today (UTC)\n"
@@ -77,19 +86,51 @@ def format_positions(db_path: Path | None = None) -> str:
     return _limit_message("\n".join(lines))
 
 
-def format_pnl(db_path: Path | None = None) -> str:
-    """Format lifetime realized paper P/L from the canonical trade ledger."""
-    stats = get_stats(db_path)
+def _pnl_block(title: str, stats: TradingStats, bankroll: bool = True) -> list[str]:
     roi = (stats.gross_pnl / stats.settled_stake) if stats.settled_stake else 0.0
-    return _limit_message(
-        "Lifetime paper P/L\n"
-        f"Realized P/L: ${stats.gross_pnl:+,.2f}\n"
-        f"Realized ROI: {roi:+.2%}\n"
+    lines = [
+        title,
+        f"Realized P/L: ${stats.gross_pnl:+,.2f}",
+        f"Realized ROI: {roi:+.2%}",
         f"Settled: {stats.settled_trades} ({stats.wins}W / {stats.losses}L, "
-        f"{stats.win_rate:.1%})\n"
-        f"Open: {stats.pending_trades}\n"
-        f"Displayed bankroll: ${stats.bankroll:,.2f}"
-    )
+        f"{stats.win_rate:.1%})",
+        f"Open: {stats.pending_trades}",
+    ]
+    if bankroll:
+        lines.append(f"Bankroll: ${stats.bankroll:,.2f}")
+    return lines
+
+
+def format_pnl(db_path: Path | None = None) -> str:
+    """Format realized paper P/L: current epoch, pre-calibration, then all-time."""
+    current = get_current_epoch(db_path)
+    blocks = [_pnl_block(
+        f"Current epoch ({current.label})",
+        get_stats(db_path, strategy_version=current.label),
+    )]
+    if current.label != LEGACY_STRATEGY_VERSION:
+        blocks.append(_pnl_block(
+            f"Pre-calibration ({LEGACY_STRATEGY_VERSION})",
+            get_stats(db_path, strategy_version=LEGACY_STRATEGY_VERSION),
+        ))
+    blocks.append(_pnl_block("All-time", get_stats(db_path), bankroll=False))
+    return _limit_message("\n\n".join("\n".join(block) for block in blocks))
+
+
+def format_pnl_epochs(db_path: Path | None = None) -> str:
+    """Format one realized P/L line per strategy epoch, oldest first."""
+    current = get_current_epoch(db_path)
+    lines = ["Realized P/L by strategy epoch"]
+    for epoch in list_epochs(db_path):
+        stats = get_stats(db_path, strategy_version=epoch.label)
+        roi = (stats.gross_pnl / stats.settled_stake) if stats.settled_stake else 0.0
+        marker = " (current)" if epoch.label == current.label else ""
+        lines.append(
+            f"{epoch.label}{marker}: ${stats.gross_pnl:+,.2f} ({roi:+.1%} ROI), "
+            f"{stats.wins}W / {stats.losses}L, {stats.pending_trades} open, "
+            f"bankroll ${stats.bankroll:,.2f}, since {epoch.started_at[:10]}"
+        )
+    return _limit_message("\n".join(lines))
 
 
 def format_status(db_path: Path | None = None) -> str:
@@ -308,7 +349,11 @@ def command_response(
     if command == "/positions":
         return format_positions(db_path)
     if command == "/pnl":
-        return format_pnl(db_path)
+        if not argument:
+            return format_pnl(db_path)
+        if argument.lower() == "all":
+            return format_pnl_epochs(db_path)
+        return "Usage: /pnl [all]"
     if command == "/status":
         return format_status(db_path)
     if command == "/settled":

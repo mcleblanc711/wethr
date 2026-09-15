@@ -39,6 +39,7 @@ SETTLED_EXPORT_COLUMNS = (
     "market_volume",
     "model_version_id",
     "prediction_snapshot_id",
+    "strategy_version",
 )
 
 

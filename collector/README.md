@@ -82,7 +82,9 @@ auto-detects the uv-managed `.venv` for direct application commands.
 | `python run.py emos` | Show trained EMOS parameters |
 | `python run.py diagnose` | Validate all API endpoints |
 | `python run.py doctor` | Show local DB/export wiring status |
-| `python run.py export-settled` | Write settled-trade JSON for n8n |
+| `python run.py export-settled` | Write settled-trade JSON for n8n (includes `strategy_version`) |
+| `python run.py epoch list` | Strategy epochs with P/L and bankroll |
+| `python run.py epoch start --label L [--bankroll N]` | Start a new paper strategy epoch |
 
 ## Probability estimation (4 phases)
 
@@ -113,6 +115,24 @@ size  = min(size, 0.05 × bankroll, $100)
 ```
 
 Why 5%? Full Kelly assumes perfect probability estimates. At 5%, a 2x overestimate of edge costs much less capital than full Kelly while still ranking larger edges above smaller ones.
+
+## Strategy epochs
+
+Every paper trade is tagged with the current strategy epoch
+(`trades.strategy_version`). Epochs are additive: starting one never changes
+existing trades. Each epoch has its own starting bankroll, and sizing and the
+daily loss limit use the current epoch's bankroll and realized P/L; open
+positions from any epoch still count toward `WETHR_MAX_PENDING`.
+
+```bash
+python run.py epoch list
+python run.py epoch start --label calib-v1 --bankroll 10000 --notes "first calibrated epoch"
+```
+
+The pre-calibration ledger is `legacy-v0`, seeded with
+`WETHR_BANKROLL + bankroll_adjustment` so its bankroll is unchanged. The current
+epoch lives in the `current_strategy_epoch` settings row and is read on every
+scan and trade, but restart the collector after deploying epoch code.
 
 ## Settlement
 
@@ -149,7 +169,7 @@ The collector pushes to the ntfy topic configured in `WETHR_NTFY_TOPIC_URL`
 (see `src/ntfy.py`):
 
 - `positions`: one push per newly opened paper position.
-- `settlements`: one push per settled trade (WIN/LOSS, P/L, lifetime P/L),
+- `settlements`: one push per settled trade (WIN/LOSS, P/L, and the running P/L of that trade's strategy epoch),
   from the loop's daily settlement cycle and from `run.py settle`.
 - `calibration`: daily/monthly calibration alerts and model promotions. Set
   `WETHR_NTFY_TOPIC_URL` on the calibration units too.
@@ -172,7 +192,8 @@ the configured bot. It accepts commands only from `WETHR_TELEGRAM_CHAT_ID`:
 | Command | Reply |
 |---------|-------|
 | `/positions` | Open paper positions |
-| `/pnl` | Lifetime realized P/L, ROI, W/L |
+| `/pnl` | Current epoch, pre-calibration (`legacy-v0`), then all-time realized P/L, ROI, W/L |
+| `/pnl all` | One realized P/L line per strategy epoch |
 | `/settled [n]` | Last n settled trades (default 10, max 20) and their total |
 | `/trade <id>` | One trade in detail, plus its n8n divergence row when audited |
 | `/today` | Positions opened and settled today (UTC) |

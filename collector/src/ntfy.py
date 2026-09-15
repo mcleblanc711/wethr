@@ -198,11 +198,15 @@ def trade_won(trade: dict[str, Any]) -> bool:
 
 def build_trade_settled_message(
     trade: dict[str, Any],
-    lifetime_pnl: float | None = None,
+    epoch_pnl: float | None = None,
     wins: int | None = None,
     losses: int | None = None,
+    epoch_label: str | None = None,
 ) -> str:
-    """Build the ntfy text for one settled position."""
+    """Build the ntfy text for one settled position.
+
+    The running-total line covers the trade's strategy epoch.
+    """
     city = trade["city"]
     city_name = config.CITIES.get(city).name if city in config.CITIES else city
     result = "WIN" if trade_won(trade) else "LOSS"
@@ -213,22 +217,24 @@ def build_trade_settled_message(
         f"Stake: ${trade['size_usd']:.2f} · Edge at entry: {trade['edge']:+.1%}",
         f"P/L: ${trade['pnl']:+.2f}",
     ]
-    if lifetime_pnl is not None:
+    if epoch_pnl is not None:
         record = f" ({wins}W / {losses}L)" if wins is not None and losses is not None else ""
-        lines.append(f"Lifetime: ${lifetime_pnl:+,.2f}{record}")
+        label = epoch_label or trade.get("strategy_version") or "current"
+        lines.append(f"Epoch {label}: ${epoch_pnl:+,.2f}{record}")
     return "\n".join(lines)
 
 
 async def notify_trade_settled(
     client: Any,
     trade: dict[str, Any],
-    lifetime_pnl: float | None = None,
+    epoch_pnl: float | None = None,
     wins: int | None = None,
     losses: int | None = None,
+    epoch_label: str | None = None,
 ) -> bool:
     """Notify ntfy that a position settled."""
     won = trade_won(trade)
-    message = build_trade_settled_message(trade, lifetime_pnl, wins, losses)
+    message = build_trade_settled_message(trade, epoch_pnl, wins, losses, epoch_label)
     return await send_message(
         client,
         message,
