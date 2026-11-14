@@ -1,0 +1,13 @@
+version: 2
+
+sources:
+  - name: raw
+    database: WETHR
+    schema: RAW
+    description: One table per SQLite table, loaded by warehouse/snowflake/load.sh.
+    tables:
+      - name: trades
+      - name: strategy_epochs
+      - name: market_snapshots
+      - name: prediction_snapshots
+      - name: market_resolutions

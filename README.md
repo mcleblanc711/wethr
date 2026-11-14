@@ -25,6 +25,10 @@ The two halves talk via the shared SQLite database in `data/wethr.db`:
   fetching, probability estimation, EMOS, BMA, position sizing, settlement.
 - **n8n-wethr/** — Docker-compose stack running n8n with the divergence audit
   workflows. Workflow JSON is checked into `n8n-wethr/workflows/`.
+- **[warehouse/](warehouse/README.md)** — Analytics stack: SQLite snapshot →
+  Parquet → Snowflake → dbt models, exposed read-only to Claude/ChatGPT via MCP.
+- **[docs/](docs/README.md)** — Project documentation, including the hands-on
+  [SQL learning guide](docs/SQL_GUIDE.md) built around the Wethr database.
 
 ## Quick start
 

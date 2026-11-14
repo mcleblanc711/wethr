@@ -1,0 +1,51 @@
+version: 2
+
+models:
+  - name: stg_trades
+    description: One row per paper trade. Timestamps normalised to UTC NTZ.
+    columns:
+      - name: trade_id
+        data_tests: [unique, not_null]
+      - name: strategy_epoch
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_strategy_epochs')
+                field: strategy_epoch
+      - name: status
+        data_tests:
+          - accepted_values:
+              arguments:
+                values: ["open", "won", "lost"]
+
+  - name: stg_strategy_epochs
+    description: One row per strategy epoch (legacy-v0, 2026-09-recal, ...).
+    columns:
+      - name: strategy_epoch
+        data_tests: [unique, not_null]
+
+  - name: stg_market_snapshots
+    description: One market bracket observed at one instant.
+    columns:
+      - name: market_snapshot_id
+        data_tests: [unique, not_null]
+
+  - name: stg_prediction_snapshots
+    description: One model prediction against one market snapshot.
+    columns:
+      - name: prediction_id
+        data_tests: [unique, not_null]
+      - name: market_snapshot_id
+        data_tests:
+          - not_null
+          - relationships:
+              arguments:
+                to: ref('stg_market_snapshots')
+                field: market_snapshot_id
+
+  - name: stg_market_resolutions
+    description: One resolution per Polymarket event (city x target date).
+    columns:
+      - name: event_id
+        data_tests: [unique, not_null]

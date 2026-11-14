@@ -1,0 +1,38 @@
+version: 2
+
+models:
+  - name: fct_trades
+    description: One row per paper trade with epoch context. Filter is_settled for performance stats.
+    columns:
+      - name: trade_id
+        data_tests: [unique, not_null]
+
+  - name: daily_pnl_by_epoch
+    description: Realised P/L, win rate and bankroll per strategy epoch per UTC settlement day.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [strategy_epoch, settled_date_utc]
+
+  - name: calibration_by_bracket
+    description: >
+      Predicted vs observed hit rate by model version and probability bucket, using
+      the latest prediction per market bracket. small_sample flags buckets with n < 30.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [model_version_id, prob_bucket_low]
+    columns:
+      - name: observed_rate
+        data_tests:
+          - dbt_utils.accepted_range:
+              arguments:
+                min_value: 0
+                max_value: 1
+
+  - name: market_spread_daily
+    description: Market spread, liquidity and volume per city per UTC capture day.
+    data_tests:
+      - dbt_utils.unique_combination_of_columns:
+          arguments:
+            combination_of_columns: [city, captured_date_utc]
