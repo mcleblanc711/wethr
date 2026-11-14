@@ -1,0 +1,21 @@
+select
+    id                                                    as market_snapshot_id,
+    convert_timezone('UTC', captured_at)::timestamp_ntz   as captured_at_utc,
+    condition_id,
+    event_id,
+    city,
+    target_date,
+    bracket_label,
+    bracket_lower,
+    bracket_upper,
+    bracket_unit,
+    yes_best_bid,
+    yes_best_ask,
+    no_best_bid,
+    no_best_ask,
+    midpoint,
+    last_price,
+    volume,
+    liquidity,
+    spread
+from {{ source('raw', 'market_snapshots') }}

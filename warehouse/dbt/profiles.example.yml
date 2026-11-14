@@ -1,0 +1,15 @@
+# Copy to ~/.dbt/profiles.yml (never commit the real one) and fill in <...>.
+# Key-pair auth for the WETHR_SVC service user created in ../snowflake/setup.sql.
+wethr:
+  target: dev
+  outputs:
+    dev:
+      type: snowflake
+      account: <orgname-accountname>     # Snowsight: Admin > Accounts > account identifier
+      user: WETHR_SVC
+      private_key_path: ~/.snowflake/keys/wethr_svc_rsa_key.p8
+      role: WETHR_TRANSFORMER
+      warehouse: WETHR_WH
+      database: WETHR
+      schema: ANALYTICS
+      threads: 4
